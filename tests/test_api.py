@@ -271,6 +271,30 @@ def test_get_session_state_from_registry_and_jsonl(tmp_path: Path) -> None:
     assert session_id == "sess-1"
 
 
+def test_context_window_for() -> None:
+    # 1M on every plan: everything outside the 200k list, incl. unknown/bare aliases.
+    for model in ("claude-opus-5", "claude-opus-4-8", "claude-sonnet-5", "opus", "sonnet", None):
+        assert detect.context_window_for(model) == 1_000_000, model
+    # Hard 200k, dated and platform-prefixed IDs included.
+    for model in (
+        "claude-haiku-4-5-20251001",
+        "claude-opus-4-5-20251101",
+        "claude-opus-4-1-20250805",
+        "claude-sonnet-4-5-20250929",
+        "claude-opus-4-20250514",
+        "claude-3-7-sonnet-20250219",
+        "anthropic.claude-opus-4-5-20251101-v1:0",
+    ):
+        assert detect.context_window_for(model) == 200_000, model
+    # Gated models: 200k until a message proves the 1M upgrade is active.
+    for model in ("claude-opus-4-6", "claude-sonnet-4-6"):
+        assert detect.context_window_for(model) == 200_000, model
+        assert detect.context_window_for(model, 199_000) == 200_000, model
+        assert detect.context_window_for(model, 250_000) == 1_000_000, model
+    # A hard-200k model can never exceed its window, so promotion never fires for it.
+    assert detect.context_window_for("claude-haiku-4-5-20251001", 150_000) == 200_000
+
+
 def test_get_session_state_stale_registry_ignored(tmp_path: Path) -> None:
     # procStart mismatch (PID reuse) → registry ignored; no JSONL either → idle, no id.
 
