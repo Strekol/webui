@@ -22,6 +22,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # detect.py is a hand-aligned copy of the detection engine both clients
+      # carry. tests/test_detection_parity.py compares the three by BEHAVIOUR —
+      # it skips when the siblings are absent locally, but FAILS under CI, so
+      # they have to be here or the guard never runs where it matters. Matching
+      # branch first (one shared-core change lands under one branch name in the
+      # three repos), default branch otherwise. Corollary, an ORDERING
+      # CONSTRAINT rather than a defect: a detection change is only green here
+      # once its twins are pushed to the client repos.
+      - name: Checkout the TUI (shared detection core, matching branch)
+        id: tui_branch
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: claude-watcher/tui
+          ref: ${{ github.head_ref || github.ref_name }}
+          path: _tui
+
+      - name: Checkout the TUI (default branch fallback)
+        if: steps.tui_branch.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          repository: claude-watcher/tui
+          path: _tui
+
+      - name: Checkout the GTK widget (shared detection core, matching branch)
+        id: gtk_branch
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: claude-watcher/gtk
+          ref: ${{ github.head_ref || github.ref_name }}
+          path: _gtk
+
+      - name: Checkout the GTK widget (default branch fallback)
+        if: steps.gtk_branch.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          repository: claude-watcher/gtk
+          path: _gtk
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:

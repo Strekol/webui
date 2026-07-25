@@ -38,7 +38,7 @@ def _argv_value(argv: list[str], flag: str) -> str | None:
     """
     try:
         return argv[argv.index(flag) + 1] or None
-    except ValueError, IndexError:
+    except (ValueError, IndexError):
         return None
 
 
@@ -180,9 +180,16 @@ def cwd_to_project_dir(cwd: str | None, config_dir: str | None = None) -> Path |
     # not the worktree cwd. Fall back to the project root. Harmless outside a
     # worktree; at worst the dir does not exist → None.
     root, _ = split_worktree(cwd)
+    # EMPTY root ('/.claude/worktrees/wt'): the slug would be '' and `base / ''`
+    # IS `base`, so we would hand back the PROJECTS DIRECTORY itself as if it were
+    # a project — and it always exists. No fallback is right here (neither '' nor
+    # the worktree cwd, which is not where Claude stores the transcript): with no
+    # root, there is no project to point at.
+    if not root:
+        return None
     # Claude slugifies the cwd by replacing EVERY non-alphanumeric char with '-'
     # (not just '/'), so 'geoffrey.laurent' → 'geoffrey-laurent'.
-    slug = re.sub(r"[^a-zA-Z0-9]", "-", root or cwd)
+    slug = re.sub(r"[^a-zA-Z0-9]", "-", root)
     path = base / slug
     return path if path.exists() else None
 
@@ -395,7 +402,7 @@ def get_session_info_from_jsonl(
                 ((f, f.stat().st_mtime) for f in jsonl_files),
                 key=lambda x: x[1],
             )
-        except OSError, ValueError:
+        except (OSError, ValueError):
             return None, None, None, None, None
     try:
         mtime = latest.stat().st_mtime
@@ -437,14 +444,14 @@ def get_session_registry(pid: int, starttime: int, config_dir: str | None = None
     sessions_dir = (Path(config_dir) / "sessions") if config_dir else _SESSIONS_DIR
     try:
         data: dict[str, Any] = json.loads((sessions_dir / f"{pid}.json").read_text())
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return None
     ps = data.get("procStart")
     if ps is not None:
         try:
             if int(ps) != starttime:
                 return None
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             pass
     return data
 
@@ -476,18 +483,41 @@ def get_session_state(
         transcript_cwd, config_dir, session_id
     )
     if reg:
+        # /rename: a user-chosen name (field `name` with nameSource != 'derived' —
+        # 'derived' = auto-generated, redundant with the cwd) wins over the JSONL's
+        # AI title as the displayed topic. Mirrors the TUI/GTK clients: the same
+        # session read locally and read over this API has to show the same topic,
+        # and the user's own wording is the one they will recognise in the list.
+        reg_name = reg.get("name")
+        if reg_name and reg.get("nameSource") != "derived":
+            topic = reg_name
         status = reg.get("status", "")
         state = _STATUS_MAP.get(status, "idle")
-        # 'shell' persists while a background shell runs (an interactive `!cmd` or
-        # a backgrounded Bash), EVEN after Claude handed control back: the status
-        # stays stuck on 'shell' while the session is actually waiting on the user.
-        # Cross-check the JSONL — if it shows the turn is over (last assistant in a
-        # terminal stop_reason → 'waiting'/'idle'), the shell is just a background
-        # residue and the real state is the JSONL's, not 'working'. jsonl_state is
-        # None if the JSONL is missing: the condition is then false and we keep the
-        # old behavior.
-        if status == "shell" and jsonl_state in ("waiting", "idle"):
-            state = jsonl_state
+        # Two registry statuses map to 'working' yet can stay STUCK there after the
+        # session handed control back:
+        #   - 'shell': a background shell (an interactive `!cmd`, a backgrounded
+        #     Bash, a Monitor) outlives the turn;
+        #   - 'busy': subagents interrupted (crash / ESC) leave the status pinned on
+        #     'busy', which never returns to 'idle' on its own.
+        # Cross-check the JSONL — a terminal stop_reason (or a post-turn system
+        # event) yields 'waiting'/'idle', i.e. the turn is over: degrade to
+        # 'background'. Background work may still be running, but Claude is not
+        # computing and is not waiting on the user either. We cannot tell a user's
+        # `!cmd` from Claude's own shell, nor a residual 'busy' from a live one (the
+        # registry is opaque there), hence ONE generic low-priority state, ranked
+        # waiting > working > background > idle in the sort below so it never steals
+        # the spotlight. A genuinely active session — including one waiting on its
+        # subagents, where the last assistant message carries the Task tool_use —
+        # yields jsonl_state='working', so the condition is false and nothing is
+        # reconciled. 'compacting' is deliberately EXCLUDED: it is real, brief
+        # foreground work. jsonl_state is None when the JSONL is missing → condition
+        # false, previous behaviour kept.
+        # This mirrors the TUI/GTK clients verbatim, and must keep doing so: the
+        # same session read locally and read over this API has to render the same
+        # state, and emitting 'waiting' here would sort a background residue to the
+        # top of a remote list as if it needed the user.
+        if status in ("shell", "busy") and jsonl_state in ("waiting", "idle"):
+            state = "background"
         # Idle-since: EXACT instant of the registry's last state change (ms epoch).
         # Preferred over the JSONL mtime, which moves for background writes
         # (summaries, todos) without reflecting real inactivity. Fall back to mtime
@@ -496,7 +526,7 @@ def get_session_state(
         if ts is not None:
             try:
                 last_activity = float(ts) / 1000.0
-            except TypeError, ValueError:
+            except (TypeError, ValueError):
                 pass
     else:
         state = jsonl_state or "idle"
@@ -545,33 +575,88 @@ def display_config_dir(path: str | None) -> str | None:
 # caches above) can be hit by several threads at once. One lock serialises the
 # whole scan: it both guards those plain-dict caches and collapses a burst of
 # concurrent polls (many browsers) onto a single /proc walk. A short TTL then
-# serves that result to everyone for ~1s — bounding /proc cost regardless of fan-out.
+# serves that result to everyone — bounding /proc cost regardless of fan-out.
+#
+# This is the ONLY scan cache. A second one layered above it would be worse than
+# redundant: the age reported to clients would measure the outer layer only, so it
+# would under-report the true age of the rows by up to the inner TTL, and a caller
+# asking for ttl=0 would still be served this cache's copy.
 _SCAN_LOCK = threading.Lock()
 _SCAN_TTL = 1.0
-# (timestamp, collect_agents, result). The flag is part of the key so a caller
-# passing a different value never gets served a snapshot built the other way.
+# (monotonic timestamp, collect_agents, result). Monotonic, NEVER the wall clock:
+# the stamp is only ever used to derive a DURATION (the cache age below, and the
+# `age_seconds` handed to clients), and time.time() would make it jump — possibly
+# negative — on an NTP step. The flag is part of the key so a caller passing a
+# different value never gets served a snapshot built the other way.
 _scan_cache: tuple[float, bool, list[dict[str, Any]]] | None = None
+# Bumped once per published walk. A caller samples it BEFORE queueing on the lock;
+# if it has moved by the time the lock is theirs, a walk completed while they
+# waited and its rows are theirs to reuse. That is single-flight collapsing, and it
+# is a SEPARATE mechanism from the TTL: the TTL reuses a snapshot across time, this
+# reuses the one walk a burst of simultaneous callers is already paying for. It
+# must therefore hold even at ttl=0 — "no reuse across time" is not "N callers, N
+# walks, one at a time under the lock".
+_scan_seq = 0
+
+
+def scan_snapshot(collect_agents: bool = True, ttl: float = _SCAN_TTL) -> tuple[list[dict[str, Any]], float]:
+    """Session rows plus the age of the snapshot they come from.
+
+    The age is not cosmetic: `idle_seconds` inside each row is measured when the
+    scan runs, so a caller served from cache must subtract this age or every
+    session looks up to one TTL less idle than it really is.
+
+    `ttl` <= 0 disables reuse and forces a real scan — and because this is the only
+    cache, that promise actually holds. It does NOT disable single-flight: callers
+    that queued while a walk was running still share its result (and are told its
+    real age, which may exceed `ttl`), because the alternative is N serialised
+    walks for one instant's worth of data.
+    """
+    global _scan_cache, _scan_seq
+    # Sampled outside the lock on purpose: everything published between here and
+    # the lock acquisition below is, by definition, a walk that finished while this
+    # caller was waiting for it.
+    seq_on_arrival = _scan_seq
+    with _SCAN_LOCK:
+        now = time.monotonic()
+        if _scan_cache is not None and _scan_cache[1] == collect_agents:
+            age = now - _scan_cache[0]
+            # Two independent reasons to serve this entry: it is still within the
+            # TTL, or it was published while we queued (single-flight).
+            if age < ttl or _scan_seq != seq_on_arrival:
+                return _scan_cache[2], age
+        # The stamp is the instant the walk STARTS, and the entry is published only
+        # once the walk has finished. Start-time because `idle_seconds` inside the
+        # rows is measured from the same clock read at the top of _scan_sessions(),
+        # so `age_seconds` (now - stamp) keeps describing the instant the data
+        # describes; stamping the end instead would report an age optimistic by the
+        # walk's whole duration. Publishing only at the end is what makes the entry
+        # visible to waiters as one completed unit — and the seq bump above it is
+        # what lets those waiters take it even when it was born already older than
+        # the TTL (a 1.5 s walk under a 1.0 s TTL: before, every queued caller
+        # missed and re-walked under this lock, so 40 pollers cost 40 walks and the
+        # last one waited 60 s).
+        result = _scan_sessions(collect_agents)
+        _scan_cache = (now, collect_agents, result)
+        _scan_seq += 1
+        # NOT 0.0: the rows were measured at `now`, before the walk, so by the time
+        # this returns they are already one walk old. Reporting 0.0 to the caller
+        # that did the walk — while every waiter gets an exact age — makes the same
+        # rows look up to a walk-duration fresher to one client than to another
+        # polling the same instant. Negligible on a healthy host, 1.5 s on the busy
+        # one this cache exists for.
+        return result, time.monotonic() - now
 
 
 def scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
     """Read-only snapshot of every running Claude Code session.
 
     Display-only: no terminal/window resolution, no focus, no signalling. Sorted
-    by state priority (waiting > working > idle), then project name. Thread-safe;
-    result is cached for _SCAN_TTL seconds and shared across callers (read-only).
-    The cache is keyed on `collect_agents` too, so mixing values stays correct.
-
-    `collect_agents` (APP_SHOW_AGENTS) skips subagent detection when False, sparing
-    a cmdline read per non-claude process on busy hosts.
+    by state priority (waiting > working > background > idle), then project name.
+    Thread-safe; cached for _SCAN_TTL seconds and shared across callers
+    (read-only). Callers that need the snapshot's age want `scan_snapshot()`.
     """
-    global _scan_cache
-    with _SCAN_LOCK:
-        now = time.time()
-        if _scan_cache is not None and _scan_cache[1] == collect_agents and now - _scan_cache[0] < _SCAN_TTL:
-            return _scan_cache[2]
-        result = _scan_sessions(collect_agents)
-        _scan_cache = (now, collect_agents, result)
-        return result
+    return scan_snapshot(collect_agents)[0]
 
 
 def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
@@ -646,5 +731,12 @@ def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
                 "daemon": False,
             }
         )
-    sessions.sort(key=lambda s: (s["state"] != "waiting", s["state"] != "working", s["project"].lower()))
+    sessions.sort(
+        key=lambda s: (
+            s["state"] != "waiting",
+            s["state"] != "working",
+            s["state"] != "background",
+            s["project"].lower(),
+        )
+    )
     return sessions

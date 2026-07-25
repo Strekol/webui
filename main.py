@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     # default; turning it off spares a /proc/<pid>/cmdline read per NON-claude
     # process on every scan — worth it on a host with thousands of processes.
     show_agents: bool = True
+    # Seconds a /proc snapshot is reused across callers. 0 (or any negative value)
+    # disables the cache. Bounds the scan cost when N browsers/watchers poll a busy
+    # host; the response carries `age_seconds` so a client knows how old the data is.
+    scan_cache_ttl: float = 1.0
     # Dev only: uvicorn auto-reload on edits + browser livereload on restart.
     reload: bool = False
 
@@ -86,15 +90,18 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-# Sync def on purpose: scan_sessions() does blocking /proc + file I/O. Declared
-# sync, Starlette runs it in a threadpool so it never stalls the event loop (and
-# /healthz) when several browsers poll concurrently.
+# Sync def on purpose: the scan does blocking /proc + file I/O. Declared sync,
+# Starlette runs it in a threadpool so it never stalls the event loop (and
+# /healthz) when several browsers poll concurrently. The cache and its lock live
+# in detect.scan_snapshot() — the one place that knows when the rows were built,
+# and therefore the only place that can report their true age.
 @app.get("/api/sessions", dependencies=[Depends(require_auth)])
 def sessions() -> dict[str, Any]:
-    rows = detect.scan_sessions(settings.show_agents)
+    rows, age = detect.scan_snapshot(settings.show_agents, settings.scan_cache_ttl)
     return {
         "count": len(rows),
         "sessions": rows,
+        "age_seconds": age,
         "auth_required": bool(settings.auth_token),
         # In dev, the page reloads itself when `instance` changes (server restart).
         "dev": settings.reload,

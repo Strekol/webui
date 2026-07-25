@@ -13,7 +13,15 @@ terminal focus, no actions, no signalling.
 | GET | `/` | open | the HTML page (polls `/api/sessions`) |
 | GET | `/healthz` | open | `{"status":"ok"}` |
 | GET | `/api/meta` | open | `{"auth_required": bool}` |
-| GET | `/api/sessions` | gated | `{count, sessions[], auth_required, dev, instance}` |
+| GET | `/api/sessions` | gated | `{count, sessions[], age_seconds, auth_required, dev, instance}` |
+
+`age_seconds` is how old the served `/proc` snapshot is. Never `0.0`, not even on a
+fresh scan: the rows are measured when the walk STARTS, so they are already one
+walk old when the response is built — and it can exceed `APP_SCAN_CACHE_TTL`
+(see below). It is measured with a monotonic
+clock, so it never goes backwards. Subtract it when deriving a session's idle
+duration from `idle_seconds` — the latter was measured when the scan ran, not when
+the response was sent.
 
 `dev`/`instance` are livereload internals (`dev` true only under `APP_RELOAD`; the
 page reloads itself when `instance` changes). Each entry in `sessions[]` carries
@@ -21,16 +29,54 @@ page reloads itself when `instance` changes). Each entry in `sessions[]` carries
 (the subagents it spawned — `{pid, name, type, model}` each) and `daemon` (true for
 the `claude daemon`, which is not a real session) among others.
 
+`state` is one of:
+
+| `state` | Meaning |
+|---|---|
+| `waiting` | blocked on you — a permission prompt or the end of a turn |
+| `working` | Claude is computing (registry `busy`/`shell`/`compacting`) |
+| `background` | the registry still says `busy`/`shell` but the transcript shows the turn is over: background work (a `!cmd`, a backgrounded Bash, a Monitor, or an interrupted subagent leaving `busy` pinned). Claude is neither computing nor waiting on you |
+| `idle` | nothing in flight |
+
+Rows are sorted **waiting → working → background → idle**, then by project.
+`background` deliberately ranks below `working` so a residue never steals the
+spotlight from a session that actually needs you. The TUI and GTK clients apply
+the identical rule — the same session must render the same way whether it is read
+locally or over this API.
+
 ## Auth (optional)
 
 Empty `APP_AUTH_TOKEN` → the API is open. Set it → `/api/sessions` requires the
-token, accepted three ways:
+token, accepted three ways — **all headers**:
 
 - `X-API-Key: <token>`
 - `Authorization: Bearer <token>`
-- `?key=<token>` — used by the web page, stored in `localStorage`
+- `Authorization: Basic <base64>` — so `curl http://remote:<token>@host/api/sessions`
+  works. The token is the **password**; when the password is empty the username is
+  used instead, which makes `http://<token>@host/` work too. The username is never
+  checked (`remote` is a convention, not a requirement).
 
-The page probes `/api/meta` and only shows a key prompt when a token is required.
+> **This server speaks plain HTTP.** It terminates no TLS — there is no
+> `ssl_certfile` knob — so an `https://` URL pointed straight at it fails with
+> `SSL: RECORD_LAYER_FAILURE`. Every example here is `http://` on purpose. Put a
+> reverse proxy (nginx, Caddy, Traefik) in front of it if you need TLS, and point
+> clients at the proxy's `https://` URL; or use an SSH tunnel to a loopback URL,
+> which keeps the token off the wire entirely. The four client READMEs carry the
+> same warning — this is the repo that owns the fact, so it states it here.
+
+> **No token in the URL.** A `?key=<token>` query form used to be accepted; it was
+> removed. The access log records `query_params` on every request, so the token
+> landed in cleartext on stdout — thousands of times over, since the page polls
+> continuously — and from there into whatever keeps the logs. A URL-borne secret
+> also leaks through browser history, `Referer` headers and proxy logs. The page
+> never needed it: it has always sent `X-API-Key`. Putting a token in a query
+> string now simply fails with 401 — and note the query is still logged, so do not
+> put secrets there.
+
+A rejected request is answered with `WWW-Authenticate: Bearer`, on purpose: a
+`Basic` challenge would make every browser loading the page pop a native
+credentials dialog. The page probes `/api/meta` and only shows a key prompt when a
+token is required.
 
 ## Display options
 
@@ -40,7 +86,7 @@ is unchanged:
 
 | Option | Values | Effect |
 |---|---|---|
-| sort | `default` / `idle` | `default` keeps the server order (waiting → working → idle, then project); `idle` floats the most-recently-idle sessions to the top of the idle group |
+| sort | `default` / `idle` | `default` keeps the server order (waiting → working → background → idle, then project); `idle` floats the most-recently-idle sessions to the top of the idle group |
 | idle | `none` / `loose` / `precise` | idle duration shown on idle rows: hidden, `[Nd ]HH:MM`, or `[Nd ]HH:MM:SS` |
 | topic | on / off | show the AI title / last prompt under each session |
 | agents | on / off | show the count of subagents each session spawned (hover for the list) |
@@ -61,10 +107,27 @@ APP_AUTH_TOKEN=hunter2 make run   # require a key
 
 Config is via `APP_*` env vars / `.env` (see `.env.example`): `APP_HOST`,
 `APP_PORT`, `APP_LOG_LEVEL`, `APP_JSON_LOGS`, `APP_AUTH_TOKEN`,
-`APP_ALLOW_INSECURE_BIND`, `APP_RELOAD`, `APP_SHOW_AGENTS`. Set
+`APP_ALLOW_INSECURE_BIND`, `APP_RELOAD`, `APP_SHOW_AGENTS`, `APP_SCAN_CACHE_TTL`. Set
 `APP_SHOW_AGENTS=false` to skip subagent detection — it spares a
 `/proc/<pid>/cmdline` read per non-`claude` process on each scan, worth it on a host
 with thousands of processes.
+
+`APP_SCAN_CACHE_TTL` (seconds, default `1.0`) is how long one `/proc` snapshot is
+reused **across time** — pollers arriving within the TTL of the last scan share it.
+`0` (or any negative value) turns off reuse *across time*: each request arriving
+after the previous scan finished gets a real scan. It does **not** turn off
+single-flight — callers that queue while a walk is running still share its result
+rather than each starting their own, and are told its real age (which may exceed
+the TTL they asked for). Those are two different things, and conflating them is
+what made this setting dangerous: at `ttl=0`, 40 concurrent pollers used to cost
+40 `/proc` walks.
+
+Requests that arrive **while a scan is running** share its result at any TTL,
+including `0` — one scan per burst, never one per caller, however slow the scan or
+short the TTL. Those callers are served rows whose `age_seconds` is the scan's real
+age (it can exceed the TTL: it is how long the walk took). There is exactly one
+cache (in `detect.py`), so `age_seconds` is the true age of the rows rather than of
+some copy of them.
 
 ### Bind safety
 

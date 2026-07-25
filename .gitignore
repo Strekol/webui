@@ -16,3 +16,7 @@ venv/
 htmlcov/
 *.log
 .secrets.baseline
+
+# Sibling repos checked out by CI for the three-way detection parity guard.
+_tui/
+_gtk/

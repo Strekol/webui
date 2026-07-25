@@ -10,6 +10,8 @@
     --bg: #1b1b1f; --panel: #232329; --line: #34343c;
     --txt: #e2e2e2; --dim: #888898; --claude: #cc785c;
     --waiting: #e86c3a; --working: #d4a052; --idle: #4caf7d;
+    /* muted teal — same value as the GTK/TUI COLOR_BACKGROUND. */
+    --background: #5c8a9e;
     --ctx-hi: #e86c3a; --ctx-mid: #d4a052;
   }
   * { box-sizing: border-box; }
@@ -62,6 +64,7 @@
   .dot.waiting { background: var(--waiting); animation: pulse 1.2s ease-in-out infinite; }
   .dot.working { background: var(--working); }
   .dot.idle    { background: var(--idle); }
+  .dot.background { background: var(--background); }
   .dot.daemon  { background: var(--dim); }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 
@@ -82,6 +85,7 @@
   .badge.waiting { color: var(--waiting); }
   .badge.working { color: var(--working); }
   .badge.idle    { color: var(--idle); }
+  .badge.background { color: var(--background); }
   .badge.daemon  { color: var(--dim); }
   .tool { color: var(--dim); font-size: 12px; }
   /* Subagent count, claude-colored, under the tool line (mirrors the GTK badge). */
@@ -201,8 +205,19 @@ function agentsTitle(agents) {
   }).join("\n");
 }
 
-// State priority bucket (waiting > working > idle).
-function bucket(s) { return s.state === "waiting" ? 0 : s.state === "working" ? 1 : 2; }
+// State priority bucket (waiting > working > background > idle) — mirrors the
+// server's sort in detect.scan_sessions and the TUI/GTK ordering.
+// NAMED, not literal: the guard in sortSessions consumes this value, and when the
+// numbering shifted (idle 2 -> 3 when `background` was inserted) the literal `2`
+// there silently kept pointing at the wrong bucket — idle rows stopped being
+// idle-sorted and background rows started being.
+const BUCKET = { waiting: 0, working: 1, background: 2, idle: 3 };
+function bucket(s) {
+  return s.state === "waiting" ? BUCKET.waiting
+       : s.state === "working" ? BUCKET.working
+       : s.state === "background" ? BUCKET.background
+       : BUCKET.idle;
+}
 // 'default' = trust the server's order (state then project — see
 // detect.scan_sessions), avoiding a redundant client re-sort that could disagree
 // on collation. 'idle' = re-sort client-side: state, then for idle rows only the
@@ -214,7 +229,9 @@ function sortSessions(sessions) {
   arr.sort((a, b) => {
     const ba = bucket(a), bb = bucket(b);
     if (ba !== bb) return ba - bb;
-    if (ba === 2) {
+    // Idle rows ONLY: a background session is running, it is not idle — the TUI
+    // and the GTK widget exclude it from this ordering for the same reason.
+    if (ba === BUCKET.idle) {
       const ia = a.idle_seconds == null ? Infinity : a.idle_seconds;
       const ib = b.idle_seconds == null ? Infinity : b.idle_seconds;
       if (ia !== ib) return ia - ib;

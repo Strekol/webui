@@ -8,11 +8,13 @@ import detect
 
 @pytest.fixture(autouse=True)
 def _reset_scan_cache() -> Iterator[None]:
-    # scan_sessions() caches results for ~1s; clear it between tests so a fast
-    # suite doesn't serve one test's snapshot to the next.
+    # detect holds the ONE scan cache (~1s by default); clear it between tests so a
+    # fast suite doesn't serve one test's snapshot to the next.
     detect._scan_cache = None
+    detect._scan_seq = 0
     yield
     detect._scan_cache = None
+    detect._scan_seq = 0
 
 
 @pytest.fixture
