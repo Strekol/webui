@@ -574,6 +574,44 @@ def test_page_bucket_order_matches_the_server() -> None:
     assert out == "0,1,2,3,3", out
 
 
+def _git_worktree_checkout(tmp_path: Path, gitdir: str) -> Path:
+    """A git worktree checkout: a `.git` FILE pointing at the repository."""
+    wt = tmp_path / "worktrees" / "feat-011"
+    (wt / "src").mkdir(parents=True)
+    (wt / ".git").write_text(f"gitdir: {gitdir}\n")
+    return wt
+
+
+def test_a_plain_git_worktree_is_recognised_from_its_dot_git_file(tmp_path: Path) -> None:
+    # `git worktree add` drops the checkout ANYWHERE: no marker in the path,
+    # unlike the Claude layout. Only the `.git` file proves it.
+    repo = tmp_path / "repo"
+    wt = _git_worktree_checkout(tmp_path, f"{repo}/.git/worktrees/feat-011")
+    assert detect.git_worktree(str(wt)) == (str(repo), "feat-011")
+    assert detect.git_worktree(str(wt / "src")) == (str(repo), "feat-011")
+    assert detect.worktree_of(str(wt), False) == (str(repo), "feat-011")
+
+
+def test_a_relative_gitdir_still_yields_the_repository_root(tmp_path: Path) -> None:
+    # `worktree.useRelativePaths` writes a gitdir relative to the worktree.
+    wt = _git_worktree_checkout(tmp_path, "../../repo/.git/worktrees/feat-011")
+    root, name = detect.git_worktree(str(wt))
+    assert root is not None
+    assert (Path(root).resolve(), name) == ((tmp_path / "repo").resolve(), "feat-011")
+
+
+def test_a_submodule_is_not_a_worktree(tmp_path: Path) -> None:
+    # A submodule also has a `.git` file, but points at `.git/modules/<name>`.
+    wt = _git_worktree_checkout(tmp_path, f"{tmp_path}/repo/.git/modules/libfoo")
+    assert detect.git_worktree(str(wt)) == (None, None)
+
+
+def test_an_ordinary_checkout_is_not_a_worktree(tmp_path: Path) -> None:
+    # `.git` DIRECTORY = main checkout: stop there, do not climb to a parent repo.
+    (tmp_path / "repo" / ".git").mkdir(parents=True)
+    assert detect.git_worktree(str(tmp_path / "repo")) == (None, None)
+
+
 @pytest.mark.parametrize("sid", ["*", "../../outside/secret", "../outside/secret", "sess-bg/../neighbour"])
 def test_a_malformed_session_id_never_reaches_the_filesystem(tmp_path: Path, sid: str) -> None:
     # The sessionId builds paths (direct path AND glob pattern). A booby-trapped
@@ -593,6 +631,16 @@ def test_a_malformed_session_id_never_reaches_the_filesystem(tmp_path: Path, sid
     state, ctx, _tool, topic, *_ = detect.get_session_state(pid, cwd, starttime=7, config_dir=str(tmp_path))
     assert (state, ctx, topic) == ("working", None, None)
     assert detect._find_transcript(sid, tmp_path / "projects" / "-tmp-bg") is None
+
+
+def test_an_unconfirmed_claude_marker_falls_back_to_the_disk_proof(tmp_path: Path) -> None:
+    # A Claude worktree IS a git worktree: when the transcript did not confirm the
+    # marker, the `.git` file settles it instead of leaving the row unmarked.
+    repo = tmp_path / "repo"
+    wt = tmp_path / "proj" / ".claude" / "worktrees" / "wt"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text(f"gitdir: {repo}/.git/worktrees/wt\n")
+    assert detect.worktree_of(str(wt), False) == (str(repo), "wt")
 
 
 def test_the_resolved_path_is_re_resolved_when_the_transcript_moves(tmp_path: Path) -> None:

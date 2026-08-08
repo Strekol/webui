@@ -83,6 +83,17 @@ PURE_CALLS: list[tuple[str, tuple[Any, ...]]] = [
     ("cwd_to_project_dir", (None, None)),
     # La racine vide vit dans son propre test plus bas : elle exige un chemin qui
     # EXISTE, ce qu'une liste statique ne peut pas préparer.
+    ("split_worktree", ("/home/u/proj/.claude/worktrees/wt/sub",)),
+    ("worktree_of", ("/home/u/proj/.claude/worktrees/wt", True)),
+    # Marqueur Claude non confirmé (transcript non résolu) : chemin brut, pas de
+    # worktree — la nuance qui distingue un vrai worktree d'un dossier qui en
+    # porte le nom par hasard.
+    ("worktree_of", ("/home/u/proj/.claude/worktrees/wt", False)),
+    ("worktree_of", ("/nexiste/pas/du/tout", True)),
+    # Worktree git ordinaire : prouvé par un `.git` FICHIER, donc rien à trouver
+    # sur un chemin absent — les trois doivent rendre (None, None) pareil.
+    ("git_worktree", ("/nexiste/pas/du/tout",)),
+    ("git_worktree", (None,)),
     ("_find_transcript", ("sess-x", Path("/nexiste/pas/du/tout"))),
     ("_parse_session_lines", ([],)),
     # `system` SANS sous-type et `system` de MILIEU de tour ne terminent pas le

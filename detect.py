@@ -170,6 +170,67 @@ def split_worktree(cwd: str | None) -> tuple[str | None, str | None]:
     return cwd, None
 
 
+def git_worktree(cwd: str | None) -> tuple[str | None, str | None]:
+    """PLAIN git worktree: (main repository root, worktree name).
+
+    Nothing to do with the Claude layout (`<project>/.claude/worktrees/<name>`,
+    see `split_worktree`): a `git worktree add` drops its checkout anywhere, so
+    that cwd carries no marker in its path. The proof is on disk — a worktree
+    root holds a `.git` FILE (not a directory) pointing at
+    `<repo>/.git/worktrees/<name>`. A `.git` directory = main checkout, stop
+    there. A `gitdir:` without `/worktrees/` = submodule.
+
+    DISPLAY only: Claude stores a plain git worktree's transcript under its OWN
+    cwd slug, so `cwd_to_project_dir` must NOT climb to the root here. Outside a
+    worktree → (None, None).
+    """
+    if not cwd:
+        return None, None
+    start = Path(cwd)
+    for d in (start, *start.parents):
+        dot = d / ".git"
+        try:
+            if dot.is_dir():
+                return None, None
+            if not dot.is_file():
+                continue
+            head = dot.read_text(errors="ignore")[:4096].strip()
+        except OSError:
+            return None, None
+        if not head.startswith("gitdir:"):
+            return None, None
+        gitdir = head[len("gitdir:") :].strip().split("\n", 1)[0]
+        # `worktree.useRelativePaths` writes a gitdir RELATIVE to the worktree
+        # directory; resolving it keeps the repository root usable.
+        target = Path(gitdir) if Path(gitdir).is_absolute() else (d / gitdir)
+        parts = target.parts
+        try:
+            i = len(parts) - 1 - parts[::-1].index("worktrees")
+        except ValueError:
+            return None, None
+        # <repo>/.git/worktrees/<name>: the root is what precedes the '.git'.
+        if i < 2 or parts[i - 1] != ".git" or i + 1 >= len(parts):
+            return None, None
+        return str(Path(*parts[: i - 1])), parts[i + 1]
+    return None, None
+
+
+def worktree_of(cwd: str | None, transcript_found: bool) -> tuple[str | None, str | None]:
+    """(project to DISPLAY, worktree name) — otherwise (cwd, None).
+
+    Claude worktree: the marker sits in the path, so it may be coincidental; it
+    only counts once the transcript resolved under the parent root. Plain git
+    worktree: the `.git` file IS the proof, nothing to confirm.
+    """
+    root, name = split_worktree(cwd)
+    if name is not None and transcript_found:
+        return root, name
+    # Unconfirmed Claude marker: do not stop there. A Claude worktree IS a git
+    # worktree, and its `.git` file proves what the path merely suggests.
+    root, name = git_worktree(cwd)
+    return (root, name) if name else (cwd, None)
+
+
 def cwd_to_project_dir(cwd: str | None, config_dir: str | None = None) -> Path | None:
     if not cwd:
         return None
@@ -746,17 +807,16 @@ def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
         state, context_pct, tool, topic, last_activity, session_id = get_session_state(
             pid, cwd, p["starttime"], config_dir
         )
-        # "Confirmed" worktree = marker detected AND transcript resolved
-        # (last_activity = mtime of the found JSONL). We then show the REAL project
-        # (parent root) + a worktree name. Unconfirmed → raw path, no worktree.
-        wt_root, wt_name = split_worktree(cwd)
-        confirmed_wt = wt_name is not None and last_activity is not None
+        # Confirmed Claude worktree (marker detected AND transcript resolved) or
+        # plain git worktree (proved by its `.git` file): show the REAL project
+        # (repository root) + a worktree name. Otherwise raw path, no worktree.
+        wt_root, wt_name = worktree_of(cwd, last_activity is not None)
         sessions.append(
             {
                 "pid": pid,
-                "project": project_label(wt_root if confirmed_wt else cwd),
-                "worktree": wt_name if confirmed_wt else None,
-                "display_cwd": (wt_root if confirmed_wt else cwd) or "?",
+                "project": project_label(wt_root),
+                "worktree": wt_name,
+                "display_cwd": wt_root or "?",
                 "cwd": cwd or "?",
                 "topic": topic,
                 "state": state,
