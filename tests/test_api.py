@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import httpx
@@ -300,7 +301,9 @@ def test_context_window_for() -> None:
     assert detect.context_window_for("claude-haiku-4-5-20251001", 150_000) == 200_000
 
 
-def _registry_and_transcript(tmp_path: Path, status: str, last_event: dict[str, object]) -> tuple[int, str]:
+def _registry_and_transcript(
+    tmp_path: Path, status: str, last_event: Mapping[str, object]
+) -> tuple[int, str]:
     """A config-dir instance holding one session: registry `status` + one JSONL event."""
     pid, starttime, cwd = 4321, 7, "/tmp/bg"
     (tmp_path / "sessions").mkdir()
@@ -313,30 +316,37 @@ def _registry_and_transcript(tmp_path: Path, status: str, last_event: dict[str, 
     return pid, cwd
 
 
-# stop_reason 'end_turn' → jsonl_state 'waiting'; a system event → 'idle'; 'tool_use'
-# → 'working' (a real turn in flight).
+# stop_reason 'end_turn' → jsonl_state 'waiting'; a TURN-END system event →
+# 'idle'; 'tool_use' → 'working' (a real turn in flight).
 _TURN_OVER = {"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}}
-# ANY `type: "system"` line means "turn over" to _parse_session_lines — `subtype`
-# is never read. Named for what the parser does, not for a discrimination it makes.
-_TURN_OVER_SYSTEM = {"type": "system", "subtype": "post_turn"}
+_TURN_OVER_SYSTEM = {"type": "system", "subtype": "turn_duration"}
+# A `system` line of a MID-turn subtype proves nothing: the parser must skip it
+# and keep reading backwards, or a working session reads as a finished turn.
+_MID_TURN_SYSTEM: list[Mapping[str, object]] = [
+    {"type": "system", "subtype": "informational"},
+    {"type": "assistant", "message": {"stop_reason": "tool_use", "content": []}},
+]
 _TURN_RUNNING = {"type": "assistant", "message": {"stop_reason": "tool_use", "content": []}}
 
 
 @pytest.mark.parametrize(
     ("status", "event", "expected"),
     [
-        # A stuck 'shell'/'busy' over a finished turn is background work, not a
-        # session that needs the user — the exact rule the TUI and GTK apply.
+        # 'shell' over a finished turn: a background shell really is running.
         ("shell", _TURN_OVER, "background"),
-        ("busy", _TURN_OVER, "background"),
-        ("busy", _TURN_OVER_SYSTEM, "background"),
+        ("shell", _TURN_OVER_SYSTEM, "background"),
+        # 'busy' over a finished turn: nothing runs, the status merely stuck —
+        # take the JSONL state. Announcing 'background' invented work that did
+        # not exist. The exact rule the TUI and GTK apply.
+        ("busy", _TURN_OVER, "waiting"),
+        ("busy", _TURN_OVER_SYSTEM, "idle"),
         # Live turn → no reconciliation; 'compacting' is excluded on purpose.
         ("busy", _TURN_RUNNING, "working"),
         ("compacting", _TURN_OVER, "working"),
     ],
 )
-def test_stuck_status_over_a_finished_turn_is_background(
-    tmp_path: Path, status: str, event: dict[str, object], expected: str
+def test_a_stuck_status_over_a_finished_turn_is_reconciled(
+    tmp_path: Path, status: str, event: Mapping[str, object], expected: str
 ) -> None:
     # The server used to emit the JSONL state ('waiting'/'idle') for 'shell' only,
     # so the same session read over the API claimed it needed the user while the
@@ -344,6 +354,39 @@ def test_stuck_status_over_a_finished_turn_is_background(
     pid, cwd = _registry_and_transcript(tmp_path, status, event)
     state, *_ = detect.get_session_state(pid, cwd, starttime=7, config_dir=str(tmp_path))
     assert state == expected
+
+
+def test_a_mid_turn_system_event_does_not_end_the_turn(tmp_path: Path) -> None:
+    # Reading any `system` line as a turn end reconciled a session that was
+    # working (registry 'busy', last assistant on tool_use) down to background.
+    pid, cwd = _registry_and_transcript(tmp_path, "busy", _MID_TURN_SYSTEM[1])
+    proj = tmp_path / "projects" / "-tmp-bg" / "sess-bg.jsonl"
+    proj.write_text("".join(json.dumps(e) + "\n" for e in reversed(_MID_TURN_SYSTEM)))
+    state, *_ = detect.get_session_state(pid, cwd, starttime=7, config_dir=str(tmp_path))
+    assert state == "working"
+
+
+def test_a_resumed_session_reads_its_own_transcript_not_a_neighbours(tmp_path: Path) -> None:
+    # `claude -r <id>` from another directory keeps the JSONL under its ORIGINAL
+    # project. The "most recent .jsonl of the cwd slug" fallback then read a
+    # NEIGHBOUR session and attributed its state, ctx% and topic to this one.
+    pid, cwd = _registry_and_transcript(tmp_path, "busy", _TURN_RUNNING)
+    origin = tmp_path / "projects" / "-tmp-elsewhere"
+    origin.mkdir(parents=True)
+    (tmp_path / "projects" / "-tmp-bg" / "sess-bg.jsonl").rename(origin / "sess-bg.jsonl")
+    (tmp_path / "projects" / "-tmp-bg" / "neighbour.jsonl").write_text(json.dumps(_TURN_OVER) + "\n")
+    state, *_ = detect.get_session_state(pid, cwd, starttime=7, config_dir=str(tmp_path))
+    assert state == "working"
+
+
+def test_no_transcript_found_keeps_the_registry_state(tmp_path: Path) -> None:
+    # Nothing beats wrong: without the session's own transcript, the registry
+    # status stands rather than being degraded on a neighbour's evidence.
+    pid, cwd = _registry_and_transcript(tmp_path, "busy", _TURN_OVER)
+    (tmp_path / "projects" / "-tmp-bg" / "sess-bg.jsonl").unlink()
+    (tmp_path / "projects" / "-tmp-bg" / "neighbour.jsonl").write_text(json.dumps(_TURN_OVER) + "\n")
+    state, *_ = detect.get_session_state(pid, cwd, starttime=7, config_dir=str(tmp_path))
+    assert state == "working"
 
 
 def test_background_sorts_between_working_and_idle(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -529,3 +572,46 @@ def test_page_bucket_order_matches_the_server() -> None:
     )
     # Same priority as detect.scan_sessions' sort and both native clients.
     assert out == "0,1,2,3,3", out
+
+
+@pytest.mark.parametrize("sid", ["*", "../../outside/secret", "../outside/secret", "sess-bg/../neighbour"])
+def test_a_malformed_session_id_never_reaches_the_filesystem(tmp_path: Path, sid: str) -> None:
+    # The sessionId builds paths (direct path AND glob pattern). A booby-trapped
+    # id read a NEIGHBOUR session's transcript ('*') or a file OUTSIDE the
+    # projects tree ('../..') — exactly what id-based resolution must prevent.
+    pid, cwd = _registry_and_transcript(tmp_path, "shell", _TURN_OVER)
+    (tmp_path / "projects" / "-tmp-bg" / "neighbour.jsonl").write_text(json.dumps(_TURN_OVER) + "\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.jsonl").write_text(json.dumps(_TURN_OVER) + "\n")
+    reg_path = tmp_path / "sessions" / f"{pid}.json"
+    reg = json.loads(reg_path.read_text())
+    reg["sessionId"] = sid
+    reg_path.write_text(json.dumps(reg))
+    # No transcript resolved → no reconciliation, the registry state stands
+    # ('shell' → working) and nothing is read from disk.
+    state, ctx, _tool, topic, *_ = detect.get_session_state(pid, cwd, starttime=7, config_dir=str(tmp_path))
+    assert (state, ctx, topic) == ("working", None, None)
+    assert detect._find_transcript(sid, tmp_path / "projects" / "-tmp-bg") is None
+
+
+def test_the_resolved_path_is_re_resolved_when_the_transcript_moves(tmp_path: Path) -> None:
+    # The cross-project hit is memorised; a dead path must not be served.
+    projects = tmp_path / "projects"
+    proj, a, b = projects / "-tmp-bg", projects / "-tmp-a", projects / "-tmp-b"
+    for d in (proj, a, b):
+        d.mkdir(parents=True)
+    (a / "sess-bg.jsonl").write_text("")
+    assert detect._find_transcript("sess-bg", proj) == a / "sess-bg.jsonl"
+    (a / "sess-bg.jsonl").rename(b / "sess-bg.jsonl")
+    assert detect._find_transcript("sess-bg", proj) == b / "sess-bg.jsonl"
+
+
+def test_a_memorised_absence_never_hides_a_transcript_created_later(tmp_path: Path) -> None:
+    # Absence is memorised to avoid rescanning every project on each tick — it must
+    # not blind a fresh session whose JSONL appears afterwards under its cwd slug.
+    proj = tmp_path / "projects" / "-tmp-bg"
+    proj.mkdir(parents=True)
+    assert detect._find_transcript("sess-bg", proj) is None
+    (proj / "sess-bg.jsonl").write_text("")
+    assert detect._find_transcript("sess-bg", proj) == proj / "sess-bg.jsonl"

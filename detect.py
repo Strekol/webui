@@ -313,6 +313,14 @@ def _read_topic(path: Path) -> tuple[str | None, str | None]:
     return title, last_prompt
 
 
+# `system` event subtypes that mark the END OF A TURN — the only ones proving
+# Claude handed control back. The others (`informational`, `api_error`,
+# `local_command`, `compact_boundary`, …) happen MID-turn: reading them as a
+# finished turn reconciled a working session down to background (registry 'busy'
+# cross-checked against a JSONL believed idle).
+_TURN_END_SUBTYPES = {"turn_duration", "stop_hook_summary", "away_summary"}
+
+
 def _parse_session_lines(lines: list[str]) -> tuple[str | None, int | None, str | None]:
     """Bottom-up parse: (state, context_pct, tool).
 
@@ -343,7 +351,7 @@ def _parse_session_lines(lines: list[str]) -> tuple[str | None, int | None, str 
                 state = "working" if sr in (None, "tool_use", "pause_turn") else "waiting"
             elif kind == "user":
                 state = "working"
-            elif kind == "system":
+            elif kind == "system" and ev.get("subtype") in _TURN_END_SUBTYPES:
                 state = "idle"
         if kind == "assistant":
             msg = ev.get("message", {})
@@ -371,6 +379,47 @@ def _parse_session_lines(lines: list[str]) -> tuple[str | None, int | None, str 
     return state, context_pct, tool
 
 
+# A sessionId is used to BUILD paths (a direct path and a glob pattern): with no
+# guard, a booby-trapped id in the registry reads outside the projects tree
+# ('../../elsewhere/secret') or reopens the neighbour bug by playing the wildcard
+# ('*'). Require ONE filename component, no '..' — deliberately not a UUID shape:
+# the day Claude changes its id format, too tight a guard would silently strip
+# ctx/topic from EVERY row.
+_SID_RE = re.compile(r"(?!\.\.?\Z)[A-Za-z0-9._-]+\Z")
+
+
+# (projects root, session_id) -> JSONL path, when it is not under the cwd slug (a
+# session resumed from another directory). Avoids rescanning every project on
+# each refresh. The root is part of the key: two CLAUDE_CONFIG_DIRs can carry the
+# same sessionId.
+_SID_PATH_CACHE: dict[tuple[str, str], Path | None] = {}
+
+
+def _find_transcript(session_id: str, project_dir: Path) -> Path | None:
+    """Session JSONL: under the cwd slug, else scanned across the other projects."""
+    if not _SID_RE.match(session_id):
+        return None
+    cand = project_dir / f"{session_id}.jsonl"
+    if cand.is_file():
+        return cand
+    root = project_dir.parent
+    key = (str(root), session_id)
+    if key in _SID_PATH_CACHE:
+        hit = _SID_PATH_CACHE[key]
+        # A memorised absence (None) is safe ONLY because the direct path above is
+        # tested on every call — a transcript appearing later under the cwd slug
+        # is therefore always seen.
+        if hit is None or hit.is_file():
+            return hit
+    if len(_SID_PATH_CACHE) > 200:
+        _SID_PATH_CACHE.clear()
+    for p in root.glob(f"*/{session_id}.jsonl"):
+        _SID_PATH_CACHE[key] = p
+        return p
+    _SID_PATH_CACHE[key] = None
+    return None
+
+
 def get_session_info_from_jsonl(
     cwd: str | None,
     config_dir: str | None = None,
@@ -381,8 +430,9 @@ def get_session_info_from_jsonl(
     Returns (state, context_pct, tool, topic, mtime). `state` only matters as a
     fallback (registry absent); `topic` = AI title, else last prompt; `mtime` =
     last activity (an "idle since" proxy), None if not found. If `session_id` is
-    given, target <session_id>.jsonl directly (exact path, no guessing); else the
-    most recent .jsonl in the project. Short-circuited by mtime + tail-only read
+    given, target <session_id>.jsonl (under the cwd slug, else in the project it
+    actually lives in) and nothing else; otherwise the most recent .jsonl in the
+    project. Short-circuited by mtime + tail-only read
     (full re-read when needed).
     """
     project_dir = cwd_to_project_dir(cwd, config_dir)
@@ -390,10 +440,15 @@ def get_session_info_from_jsonl(
         return None, None, None, None, None
     latest: Path | None = None
     if session_id:
-        cand = project_dir / f"{session_id}.jsonl"
-        if cand.is_file():
-            latest = cand
-    if latest is None:
+        # The transcript does not necessarily live under the cwd slug: a session
+        # resumed from another directory (`claude -r <id>`) keeps its original
+        # JSONL. Falling back to "most recent .jsonl in the project" here read a
+        # NEIGHBOUR session's state and attributed it to this one (status, ctx%,
+        # topic). Nothing beats wrong: no fallback once the id is known.
+        latest = _find_transcript(session_id, project_dir)
+        if latest is None:
+            return None, None, None, None, None
+    else:
         jsonl_files = [f for f in project_dir.glob("*.jsonl") if f.is_file()]
         if not jsonl_files:
             return None, None, None, None, None
@@ -493,31 +548,20 @@ def get_session_state(
             topic = reg_name
         status = reg.get("status", "")
         state = _STATUS_MAP.get(status, "idle")
-        # Two registry statuses map to 'working' yet can stay STUCK there after the
-        # session handed control back:
-        #   - 'shell': a background shell (an interactive `!cmd`, a backgrounded
-        #     Bash, a Monitor) outlives the turn;
-        #   - 'busy': subagents interrupted (crash / ESC) leave the status pinned on
-        #     'busy', which never returns to 'idle' on its own.
-        # Cross-check the JSONL — a terminal stop_reason (or a post-turn system
-        # event) yields 'waiting'/'idle', i.e. the turn is over: degrade to
-        # 'background'. Background work may still be running, but Claude is not
-        # computing and is not waiting on the user either. We cannot tell a user's
-        # `!cmd` from Claude's own shell, nor a residual 'busy' from a live one (the
-        # registry is opaque there), hence ONE generic low-priority state, ranked
-        # waiting > working > background > idle in the sort below so it never steals
-        # the spotlight. A genuinely active session — including one waiting on its
-        # subagents, where the last assistant message carries the Task tool_use —
-        # yields jsonl_state='working', so the condition is false and nothing is
-        # reconciled. 'compacting' is deliberately EXCLUDED: it is real, brief
-        # foreground work. jsonl_state is None when the JSONL is missing → condition
-        # false, previous behaviour kept.
-        # This mirrors the TUI/GTK clients verbatim, and must keep doing so: the
-        # same session read locally and read over this API has to render the same
-        # state, and emitting 'waiting' here would sort a background residue to the
-        # top of a remote list as if it needed the user.
-        if status in ("shell", "busy") and jsonl_state in ("waiting", "idle"):
-            state = "background"
+        # A 'shell'/'busy' status can stay STUCK after the turn ended, but the two
+        # do not mean the same thing: 'shell' = a background shell really is
+        # running (low-priority state, waiting > working > background > idle);
+        # 'busy' = nothing runs, the registry merely stopped being written
+        # (interrupted subagents, a session the user backgrounded). 'compacting'
+        # is EXCLUDED: real, brief foreground work. jsonl_state None (no JSONL) or
+        # 'working' (turn in flight, subagents included) → nothing reconciled.
+        # Mirrors the TUI/GTK clients: the same session read locally and over this
+        # API has to render the same state.
+        if jsonl_state in ("waiting", "idle"):
+            if status == "shell":
+                state = "background"
+            elif status == "busy":
+                state = jsonl_state
         # Idle-since: EXACT instant of the registry's last state change (ms epoch).
         # Preferred over the JSONL mtime, which moves for background writes
         # (summaries, todos) without reflecting real inactivity. Fall back to mtime
