@@ -577,8 +577,11 @@ def get_session_state(
     cwd: str | None,
     starttime: int = 0,
     config_dir: str | None = None,
-) -> tuple[str, int | None, str | None, str | None, float | None, str | None]:
-    """Session state. Returns (state, context_pct, tool, topic, last_activity, session_id).
+) -> tuple[str, int | None, str | None, str | None, float | None, str | None, bool]:
+    """Session state. Returns (state, context_pct, tool, topic, last_activity, session_id,
+    bg_shell) — bg_shell says a background shell outlived the turn. The state describes
+    ONLY Claude's availability: a background shell is a detail ABOUT the session, not
+    what the session IS.
 
     The registry ~/.claude/sessions/<pid>.json (`status` field) wins when present;
     depending on the Claude Code version it may be absent, in which case state is
@@ -589,6 +592,7 @@ def get_session_state(
     """
     reg = get_session_registry(pid, starttime, config_dir)
     session_id = reg.get("sessionId") if reg else None
+    bg_shell = False
     # The transcript slug is computed from the session's STARTUP cwd, which the
     # registry records. The live /proc cwd drifts when the dir is renamed or the
     # user cd's mid-session — slugifying it would point at a project dir that does
@@ -618,11 +622,9 @@ def get_session_state(
         # 'working' (turn in flight, subagents included) → nothing reconciled.
         # Mirrors the TUI/GTK clients: the same session read locally and over this
         # API has to render the same state.
-        if jsonl_state in ("waiting", "idle"):
-            if status == "shell":
-                state = "background"
-            elif status == "busy":
-                state = jsonl_state
+        if status in ("shell", "busy") and jsonl_state in ("waiting", "idle"):
+            state = jsonl_state
+            bg_shell = status == "shell"
         # Idle-since: EXACT instant of the registry's last state change (ms epoch).
         # Preferred over the JSONL mtime, which moves for background writes
         # (summaries, todos) without reflecting real inactivity. Fall back to mtime
@@ -635,7 +637,7 @@ def get_session_state(
                 pass
     else:
         state = jsonl_state or "idle"
-    return state, context_pct, tool, topic, last_activity, session_id
+    return state, context_pct, tool, topic, last_activity, session_id, bg_shell
 
 
 def project_label(cwd: str | None) -> str:
@@ -793,6 +795,7 @@ def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
                     "cwd": cwd or "?",
                     "topic": None,
                     "state": "daemon",
+                    "bg_shell": False,
                     "context_pct": None,
                     "tool": None,
                     "elapsed": p["elapsed"],
@@ -804,7 +807,7 @@ def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
             )
             continue
 
-        state, context_pct, tool, topic, last_activity, session_id = get_session_state(
+        state, context_pct, tool, topic, last_activity, session_id, bg_shell = get_session_state(
             pid, cwd, p["starttime"], config_dir
         )
         # Confirmed Claude worktree (marker detected AND transcript resolved) or
@@ -820,6 +823,7 @@ def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
                 "cwd": cwd or "?",
                 "topic": topic,
                 "state": state,
+                "bg_shell": bg_shell,
                 "context_pct": context_pct,
                 "tool": tool,
                 "elapsed": p["elapsed"],
@@ -835,11 +839,13 @@ def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
                 "daemon": False,
             }
         )
+    # Only AVAILABILITY ranks here (waiting > working > idle). A background shell
+    # had a rank of its own and pushed an available session above idle ones; it is
+    # a detail about the session, carried by `bg_shell`, not an ordering criterion.
     sessions.sort(
         key=lambda s: (
             s["state"] != "waiting",
             s["state"] != "working",
-            s["state"] != "background",
             s["project"].lower(),
         )
     )

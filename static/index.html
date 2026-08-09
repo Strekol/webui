@@ -64,7 +64,6 @@
   .dot.waiting { background: var(--waiting); animation: pulse 1.2s ease-in-out infinite; }
   .dot.working { background: var(--working); }
   .dot.idle    { background: var(--idle); }
-  .dot.background { background: var(--background); }
   .dot.daemon  { background: var(--dim); }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 
@@ -85,7 +84,9 @@
   .badge.waiting { color: var(--waiting); }
   .badge.working { color: var(--working); }
   .badge.idle    { color: var(--idle); }
-  .badge.background { color: var(--background); }
+  /* Background-shell marker, on the detail sub-line next to the subagent count:
+     a detail ABOUT the session, not what the session is. */
+  .bgsh { color: var(--background); }
   .badge.daemon  { color: var(--dim); }
   .tool { color: var(--dim); font-size: 12px; }
   /* Subagent count, claude-colored, under the tool line (mirrors the GTK badge). */
@@ -205,17 +206,17 @@ function agentsTitle(agents) {
   }).join("\n");
 }
 
-// State priority bucket (waiting > working > background > idle) — mirrors the
-// server's sort in detect.scan_sessions and the TUI/GTK ordering.
+// State priority bucket (waiting > working > idle) — mirrors the server's sort in
+// detect.scan_sessions and the TUI/GTK ordering. A background shell no longer has
+// a bucket of its own: it says nothing about Claude's availability, which is what
+// this ordering ranks.
 // NAMED, not literal: the guard in sortSessions consumes this value, and when the
-// numbering shifted (idle 2 -> 3 when `background` was inserted) the literal `2`
-// there silently kept pointing at the wrong bucket — idle rows stopped being
-// idle-sorted and background rows started being.
-const BUCKET = { waiting: 0, working: 1, background: 2, idle: 3 };
+// numbering last shifted the literal `2` there silently kept pointing at the wrong
+// bucket — idle rows stopped being idle-sorted.
+const BUCKET = { waiting: 0, working: 1, idle: 2 };
 function bucket(s) {
   return s.state === "waiting" ? BUCKET.waiting
        : s.state === "working" ? BUCKET.working
-       : s.state === "background" ? BUCKET.background
        : BUCKET.idle;
 }
 // 'default' = trust the server's order (state then project — see
@@ -229,8 +230,8 @@ function sortSessions(sessions) {
   arr.sort((a, b) => {
     const ba = bucket(a), bb = bucket(b);
     if (ba !== bb) return ba - bb;
-    // Idle rows ONLY: a background session is running, it is not idle — the TUI
-    // and the GTK widget exclude it from this ordering for the same reason.
+    // Idle rows ONLY. A background shell no longer excludes a row from this
+    // ordering: Claude handed control back, the session IS idle.
     if (ba === BUCKET.idle) {
       const ia = a.idle_seconds == null ? Infinity : a.idle_seconds;
       const ib = b.idle_seconds == null ? Infinity : b.idle_seconds;
@@ -244,6 +245,46 @@ function sortSessions(sessions) {
 function authHeaders() {
   const t = localStorage.getItem(TOKEN_KEY);
   return t ? { "X-API-Key": t } : {};
+}
+
+// Row markup for ONE session. Split out of renderSessions so it can run under
+// node in the tests: the rest of renderSessions touches the DOM and cannot.
+function rowHtml(s) {
+    const active = s.state === "working" || s.state === "waiting";
+    const wt = s.worktree
+      ? `<div class="wt" title="${esc(s.cwd)}">↳ WT: ${esc(s.worktree)}</div>` : "";
+    const topic = prefs.topic && s.topic
+      ? `<div class="topic" title="${esc(s.topic)}">${esc(s.topic)}</div>` : "";
+    const cfg = s.config_dir ? ` <span class="cfg">✳${esc(s.config_dir)}</span>` : "";
+    const meta = `pid ${s.pid} · ${fmtElapsed(s.elapsed)}${ctxSpan(s.context_pct)}${cfg}`;
+    // Right column tracks GTK: state word on top, current tool (active) or idle
+    // duration (idle) below.
+    const tool = active && s.tool ? esc(s.tool)
+               : (s.state === "idle" ? fmtIdle(s.idle_seconds, prefs.idle) : "");
+
+    // Detail sub-line: subagents and background shell share it. The marker is NOT
+    // glued to the badge, which has to stay short.
+    const agents = (prefs.agents && s.agents) ? s.agents : [];
+    const detail = [];
+    if (agents.length) {
+      detail.push(`<span title="${esc(agentsTitle(agents))}">${agents.length} ${agents.length > 1 ? "agents" : "agent"}</span>`);
+    }
+    if (s.bg_shell) detail.push('<span class="bgsh" title="background shell">⚙ sh</span>');
+    const agentsLine = detail.length ? `<div class="agents">${detail.join(" ")}</div>` : "";
+    const dmark = s.daemon ? '<span class="dmark">(D)</span> ' : "";
+    return `<div class="row">
+      <span class="dot ${esc(s.state)}"></span>
+      <div class="info">
+        <div class="proj" title="${esc(s.cwd)}">${dmark}${esc(s.project)}</div>
+        ${wt}${topic}
+        <div class="metaline">${meta}</div>
+      </div>
+      <div class="right">
+        <div class="badge ${esc(s.state)}">${esc(s.state)}</div>
+        ${tool ? `<div class="tool">${tool}</div>` : ""}
+        ${agentsLine}
+      </div>
+    </div>`;
 }
 
 function renderSessions(data) {
@@ -266,37 +307,7 @@ function renderSessions(data) {
     $main.innerHTML = '<div class="empty">No running Claude Code sessions.</div>';
     return;
   }
-  $main.innerHTML = sortSessions(list).map((s) => {
-    const active = s.state === "working" || s.state === "waiting";
-    const wt = s.worktree
-      ? `<div class="wt" title="${esc(s.cwd)}">↳ WT: ${esc(s.worktree)}</div>` : "";
-    const topic = prefs.topic && s.topic
-      ? `<div class="topic" title="${esc(s.topic)}">${esc(s.topic)}</div>` : "";
-    const cfg = s.config_dir ? ` <span class="cfg">✳${esc(s.config_dir)}</span>` : "";
-    const meta = `pid ${s.pid} · ${fmtElapsed(s.elapsed)}${ctxSpan(s.context_pct)}${cfg}`;
-    // Right column tracks GTK: state word on top, current tool (active) or idle
-    // duration (idle) below.
-    const tool = active && s.tool ? esc(s.tool)
-               : (s.state === "idle" ? fmtIdle(s.idle_seconds, prefs.idle) : "");
-    const agents = (prefs.agents && s.agents) ? s.agents : [];
-    const agentsLine = agents.length
-      ? `<div class="agents" title="${esc(agentsTitle(agents))}">${agents.length} ${agents.length > 1 ? "agents" : "agent"}</div>`
-      : "";
-    const dmark = s.daemon ? '<span class="dmark">(D)</span> ' : "";
-    return `<div class="row">
-      <span class="dot ${esc(s.state)}"></span>
-      <div class="info">
-        <div class="proj" title="${esc(s.cwd)}">${dmark}${esc(s.project)}</div>
-        ${wt}${topic}
-        <div class="metaline">${meta}</div>
-      </div>
-      <div class="right">
-        <div class="badge ${esc(s.state)}">${esc(s.state)}</div>
-        ${tool ? `<div class="tool">${tool}</div>` : ""}
-        ${agentsLine}
-      </div>
-    </div>`;
-  }).join("");
+  $main.innerHTML = sortSessions(list).map(rowHtml).join("");
 }
 
 // Reflect saved prefs into the controls and wire change handlers: the four prefs

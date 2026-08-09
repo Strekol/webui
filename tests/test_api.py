@@ -62,7 +62,7 @@ def test_scan_sessions_no_procs(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _one_proc(
     monkeypatch: pytest.MonkeyPatch,
-    state_tuple: tuple[str, int | None, str | None, str | None, float | None, str | None],
+    state_tuple: tuple[str, int | None, str | None, str | None, float | None, str | None, bool],
     agents: dict[str, list[dict[str, object]]] | None = None,
 ) -> None:
     monkeypatch.setattr(
@@ -78,7 +78,7 @@ def _one_proc(
 def test_idle_seconds_computed_server_side(monkeypatch: pytest.MonkeyPatch) -> None:
     # idle_seconds is derived from last_activity on the server (clock-skew proof),
     # clamped to >=0, and present (>= the elapsed since last_activity).
-    _one_proc(monkeypatch, ("idle", 5, None, "topic", time.time() - 120, None))
+    _one_proc(monkeypatch, ("idle", 5, None, "topic", time.time() - 120, None, False))
     rows = detect.scan_sessions()
     assert len(rows) == 1
     assert rows[0]["idle_seconds"] is not None
@@ -86,20 +86,20 @@ def test_idle_seconds_computed_server_side(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_idle_seconds_none_without_activity(monkeypatch: pytest.MonkeyPatch) -> None:
-    _one_proc(monkeypatch, ("working", 5, "Bash", None, None, None))
+    _one_proc(monkeypatch, ("working", 5, "Bash", None, None, None, False))
     rows = detect.scan_sessions()
     assert rows[0]["idle_seconds"] is None
 
 
 def test_idle_seconds_clamped_non_negative(monkeypatch: pytest.MonkeyPatch) -> None:
     # last_activity slightly in the future (skewed statusUpdatedAt) → 0, never < 0.
-    _one_proc(monkeypatch, ("idle", 5, None, None, time.time() + 30, None))
+    _one_proc(monkeypatch, ("idle", 5, None, None, time.time() + 30, None, False))
     rows = detect.scan_sessions()
     assert rows[0]["idle_seconds"] == 0
 
 
 def test_no_agents_yields_empty_list(monkeypatch: pytest.MonkeyPatch) -> None:
-    _one_proc(monkeypatch, ("working", 5, "Task", None, None, "sess-1"))
+    _one_proc(monkeypatch, ("working", 5, "Task", None, None, "sess-1", False))
     rows = detect.scan_sessions()
     assert rows[0]["agents"] == []
 
@@ -108,7 +108,7 @@ def test_agents_attached_by_parent_session_id(monkeypatch: pytest.MonkeyPatch) -
     # Subagents keyed by the child's --parent-session-id are attached to the
     # session whose registry sessionId matches.
     agents = {"sess-1": [{"pid": 42, "name": "explorer", "type": "Explore", "model": "opus-4-8"}]}
-    _one_proc(monkeypatch, ("working", 5, "Task", None, None, "sess-1"), agents=agents)
+    _one_proc(monkeypatch, ("working", 5, "Task", None, None, "sess-1", False), agents=agents)
     rows = detect.scan_sessions()
     assert rows[0]["agents"] == agents["sess-1"]
 
@@ -116,7 +116,7 @@ def test_agents_attached_by_parent_session_id(monkeypatch: pytest.MonkeyPatch) -
 def test_agents_not_attached_when_session_id_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
     # A subagent parented to a different session id is not attached here.
     agents = {"other": [{"pid": 42, "name": "explorer", "type": None, "model": None}]}
-    _one_proc(monkeypatch, ("working", 5, "Task", None, None, "sess-1"), agents=agents)
+    _one_proc(monkeypatch, ("working", 5, "Task", None, None, "sess-1", False), agents=agents)
     rows = detect.scan_sessions()
     assert rows[0]["agents"] == []
 
@@ -144,7 +144,7 @@ def test_daemon_row_is_minimal_and_flagged(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_non_daemon_row_flagged_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    _one_proc(monkeypatch, ("working", 5, "Bash", None, None, "sess-1"))
+    _one_proc(monkeypatch, ("working", 5, "Bash", None, None, "sess-1", False))
     rows = detect.scan_sessions()
     assert rows[0]["daemon"] is False
 
@@ -207,7 +207,7 @@ def test_scan_cache_keyed_on_collect_agents(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(detect, "get_cwd", lambda pid: "/tmp/proj")
     monkeypatch.setattr(detect, "get_env", lambda pid: {})
     monkeypatch.setattr(
-        detect, "get_session_state", lambda *a, **k: ("working", 5, "Task", None, None, "sess-1")
+        detect, "get_session_state", lambda *a, **k: ("working", 5, "Task", None, None, "sess-1", False)
     )
     assert detect.scan_sessions(True)[0]["agents"] == agents["sess-1"]
     assert detect.scan_sessions(False)[0]["agents"] == []  # not the cached True snapshot
@@ -266,7 +266,7 @@ def test_get_session_state_from_registry_and_jsonl(tmp_path: Path) -> None:
         + "\n"
     )
 
-    state, ctx, tool, topic, last_activity, session_id = detect.get_session_state(
+    state, ctx, tool, topic, last_activity, session_id, _bg = detect.get_session_state(
         pid, cwd, starttime, config_dir=str(tmp_path)
     )
     assert state == "working"  # registry status 'busy' → working
@@ -332,9 +332,10 @@ _TURN_RUNNING = {"type": "assistant", "message": {"stop_reason": "tool_use", "co
 @pytest.mark.parametrize(
     ("status", "event", "expected"),
     [
-        # 'shell' over a finished turn: a background shell really is running.
-        ("shell", _TURN_OVER, "background"),
-        ("shell", _TURN_OVER_SYSTEM, "background"),
+        # 'shell' over a finished turn: Claude handed control back, so the state
+        # says so; the shell travels in bg_shell (asserted in its own test below).
+        ("shell", _TURN_OVER, "waiting"),
+        ("shell", _TURN_OVER_SYSTEM, "idle"),
         # 'busy' over a finished turn: nothing runs, the status merely stuck —
         # take the JSONL state. Announcing 'background' invented work that did
         # not exist. The exact rule the TUI and GTK apply.
@@ -391,7 +392,7 @@ def test_no_transcript_found_keeps_the_registry_state(tmp_path: Path) -> None:
 
 def test_background_sorts_between_working_and_idle(monkeypatch: pytest.MonkeyPatch) -> None:
     # Row order must match the clients' priority: waiting > working > background > idle.
-    states = ["idle", "background", "waiting", "working"]
+    states = ["idle", "idle", "waiting", "working"]
     procs = [{"pid": i, "elapsed": 1, "start_unix": 0.0, "starttime": 0} for i in range(len(states))]
     monkeypatch.setattr(detect, "scan_proc", lambda *a, **k: (procs, {}))
     monkeypatch.setattr(detect, "get_cwd", lambda pid: "/tmp/proj")
@@ -399,9 +400,9 @@ def test_background_sorts_between_working_and_idle(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(
         detect,
         "get_session_state",
-        lambda pid, *a, **k: (states[pid], None, None, None, None, None),
+        lambda pid, *a, **k: (states[pid], None, None, None, None, None, False),
     )
-    assert [s["state"] for s in detect.scan_sessions()] == ["waiting", "working", "background", "idle"]
+    assert [s["state"] for s in detect.scan_sessions()] == ["waiting", "working", "idle", "idle"]
 
 
 def test_a_renamed_registry_topic_wins_over_the_ai_title(tmp_path: Path) -> None:
@@ -449,7 +450,7 @@ def test_get_session_state_stale_registry_ignored(tmp_path: Path) -> None:
     (tmp_path / "sessions" / f"{pid}.json").write_text(
         json.dumps({"procStart": 999, "sessionId": "stale", "status": "busy"})
     )
-    state, ctx, tool, topic, last_activity, session_id = detect.get_session_state(
+    state, ctx, tool, topic, last_activity, session_id, _bg = detect.get_session_state(
         pid, "/tmp/nope", starttime=42, config_dir=str(tmp_path)
     )
     assert state == "idle"
@@ -515,11 +516,15 @@ def _run_page_js(snippet: str) -> str:
     """
     page = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text()
     # Pull the two functions verbatim out of the page — no second copy to drift.
-    start = page.index("const BUCKET =")
-    end = page.index("function authHeaders", start)
+    start = page.index("const esc =")
+    end = page.index("function renderSessions", start)
     src = page[start:end]
     proc = subprocess.run(
-        ["node", "-e", src + "\nconst prefs={sort:'idle'};\n" + snippet],
+        [
+            "node",
+            "-e",
+            src + "\nconst prefs={sort:'idle',topic:true,agents:true,idle:'loose',daemons:true};\n" + snippet,
+        ],
         capture_output=True,
         text=True,
         timeout=30,
@@ -531,9 +536,8 @@ def _run_page_js(snippet: str) -> str:
 def test_page_idle_sort_orders_idle_rows_and_spares_background() -> None:
     """`sort=idle` must order IDLE rows by idle time and leave background alone.
 
-    Both halves matter: the mode exists for idle rows, and a background session is
-    running — the TUI (claude-watcher-tui.py) and the GTK widget both exclude it
-    from this ordering for that reason.
+    A background shell no longer excludes a row: Claude handed control back, the
+    session IS idle and sorts with the idle ones — in the page as in both clients.
     """
     if not shutil.which("node"):
         # Never a silent skip in CI: an untested layer that reports "passed" is how
@@ -545,20 +549,19 @@ def test_page_idle_sort_orders_idle_rows_and_spares_background() -> None:
     out = _run_page_js(
         """
         const rows = [
-          {state:'idle',       project:'alpha', idle_seconds:9000},
-          {state:'idle',       project:'zeta',  idle_seconds:10},
-          {state:'background', project:'alpha', idle_seconds:9000},
-          {state:'background', project:'zeta',  idle_seconds:10},
+          {state:'idle', project:'alpha', idle_seconds:9000},
+          {state:'idle', project:'zeta',  idle_seconds:10},
+          {state:'idle', project:'beta',  idle_seconds:5000, bg_shell:true},
+          {state:'working', project:'gamma', idle_seconds:1},
         ];
         const s = sortSessions(rows);
         console.log(s.map(r => r.state + ':' + r.project).join(','));
         """
     )
     order = out.split(",")
-    # Idle rows: most-recently-idle first → zeta (10s) before alpha (9000s).
-    assert order[2:] == ["idle:zeta", "idle:alpha"], out
-    # Background rows: server order kept (alphabetical), NOT idle-sorted.
-    assert order[:2] == ["background:alpha", "background:zeta"], out
+    # working first, then idle rows most-recently-idle first — the row carrying a
+    # background shell takes its place among them (5000s), it is not set apart.
+    assert order == ["working:gamma", "idle:zeta", "idle:beta", "idle:alpha"], out
 
 
 def test_page_bucket_order_matches_the_server() -> None:
@@ -567,11 +570,10 @@ def test_page_bucket_order_matches_the_server() -> None:
             pytest.fail("node is required to run the page-JS tests in CI")
         pytest.skip("node not installed")
     out = _run_page_js(
-        "console.log(['waiting','working','background','idle','daemon']"
-        ".map(st => bucket({state: st})).join(','))"
+        "console.log(['waiting','working','idle','daemon'].map(st => bucket({state: st})).join(','))"
     )
     # Same priority as detect.scan_sessions' sort and both native clients.
-    assert out == "0,1,2,3,3", out
+    assert out == "0,1,2,2", out
 
 
 def _git_worktree_checkout(tmp_path: Path, gitdir: str) -> Path:
@@ -663,3 +665,53 @@ def test_a_memorised_absence_never_hides_a_transcript_created_later(tmp_path: Pa
     assert detect._find_transcript("sess-bg", proj) is None
     (proj / "sess-bg.jsonl").write_text("")
     assert detect._find_transcript("sess-bg", proj) == proj / "sess-bg.jsonl"
+
+
+def test_a_background_shell_travels_as_a_marker_not_a_state(tmp_path: Path) -> None:
+    # The state says whether Claude is available; the shell is a detail ABOUT the
+    # session. Emitting it as a state made a session at the prompt read as busy.
+    pid, cwd = _registry_and_transcript(tmp_path, "shell", _TURN_OVER)
+    state, _ctx, _tool, _topic, _la, _sid, bg_shell = detect.get_session_state(
+        pid, cwd, starttime=7, config_dir=str(tmp_path)
+    )
+    assert (state, bg_shell) == ("waiting", True)
+    assert state != "background"
+
+
+def test_no_shell_means_no_marker(tmp_path: Path) -> None:
+    # Counter-proof: a stuck 'busy' reconciles the same way but raises no marker,
+    # otherwise the marker stops distinguishing anything.
+    pid, cwd = _registry_and_transcript(tmp_path, "busy", _TURN_OVER)
+    state, *_rest, bg_shell = detect.get_session_state(pid, cwd, starttime=7, config_dir=str(tmp_path))
+    assert (state, bg_shell) == ("waiting", False)
+
+
+def test_the_api_row_carries_bg_shell(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The wire field is what the clients read; without it a remote row cannot tell
+    # an idle session from an idle session with a shell behind it.
+    _one_proc(monkeypatch, ("idle", 5, None, None, None, "sess-1", True))
+    row = detect.scan_sessions()[0]
+    assert (row["state"], row["bg_shell"]) == ("idle", True)
+
+
+def test_the_page_marks_a_background_shell_without_changing_the_state() -> None:
+    # The badge says what Claude is doing; the ⚙ marker says a shell outlived the
+    # turn. Emitting it as a state made an available session read as busy.
+    if not shutil.which("node"):
+        if os.getenv("CI"):
+            pytest.fail("node is required to run the page-JS tests in CI")
+        pytest.skip("node not installed")
+    out = _run_page_js(
+        """
+        const row = {pid: 1, state:'idle', bg_shell:true, project:'p', cwd:'/p',
+                     display_cwd:'/p', elapsed:1, idle_seconds:5, agents:[]};
+        const html = rowHtml(row);
+        // The marker belongs to the detail sub-line, not to the state badge.
+        const at = html.indexOf('class="badge');
+        const badge = html.slice(at, html.indexOf('</div>', at));
+        console.log([html.includes('⚙ sh'), html.includes('badge idle'),
+                     badge.includes('⚙')].join(','));
+        """
+    )
+    marker, idle_badge, marker_in_badge = out.split(",")
+    assert (marker, idle_badge, marker_in_badge) == ("true", "true", "false"), out

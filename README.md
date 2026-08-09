@@ -25,7 +25,7 @@ the response was sent.
 
 `dev`/`instance` are livereload internals (`dev` true only under `APP_RELOAD`; the
 page reloads itself when `instance` changes). Each entry in `sessions[]` carries
-`project`, `state`, `context_pct`, `tool`, `topic`, `idle_seconds`, `agents[]`
+`project`, `state`, `bg_shell`, `context_pct`, `tool`, `topic`, `idle_seconds`, `agents[]`
 (the subagents it spawned — `{pid, name, type, model}` each) and `daemon` (true for
 the `claude daemon`, which is not a real session) among others.
 
@@ -35,11 +35,15 @@ the `claude daemon`, which is not a real session) among others.
 |---|---|
 | `waiting` | blocked on you — a permission prompt or the end of a turn |
 | `working` | Claude is computing (registry `busy`/`shell`/`compacting`) |
-| `background` | the registry still says `shell` but the transcript shows the turn is over: a background shell really is running (a `!cmd`, a backgrounded Bash, a Monitor). Claude is neither computing nor waiting on you. A pinned `busy` is NOT this — nothing runs there, so the transcript state (`waiting`/`idle`) is used instead |
 | `idle` | nothing in flight |
 
-Rows are sorted **waiting → working → background → idle**, then by project.
-`background` deliberately ranks below `working` so a residue never steals the
+A separate boolean, `bg_shell`, says a background shell outlived the turn (a
+`!cmd`, a backgrounded Bash, a Monitor). It is a detail ABOUT the session, not a
+state: the page renders it as a `⚙ sh` marker beside the badge, and it changes
+neither the ordering nor the idle duration — Claude handed control back.
+
+Rows are sorted **waiting → working → idle**, then by project.
+Only availability ranks here, so a background shell never steals the
 spotlight from a session that actually needs you. The TUI and GTK clients apply
 the identical rule — the same session must render the same way whether it is read
 locally or over this API.
@@ -86,7 +90,7 @@ is unchanged:
 
 | Option | Values | Effect |
 |---|---|---|
-| sort | `default` / `idle` | `default` keeps the server order (waiting → working → background → idle, then project); `idle` floats the most-recently-idle sessions to the top of the idle group |
+| sort | `default` / `idle` | `default` keeps the server order (waiting → working → idle, then project); `idle` floats the most-recently-idle sessions to the top of the idle group |
 | idle | `none` / `loose` / `precise` | idle duration shown on idle rows: hidden, `[Nd ]HH:MM`, or `[Nd ]HH:MM:SS` |
 | topic | on / off | show the AI title / last prompt under each session |
 | agents | on / off | show the count of subagents each session spawned (hover for the list) |
