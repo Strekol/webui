@@ -22,6 +22,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # detect.py is a hand-aligned copy of the detection engine both clients
+      # carry. tests/test_detection_parity.py compares the three by BEHAVIOUR —
+      # it skips when the siblings are absent locally, but FAILS under CI, so
+      # they have to be here or the guard never runs where it matters. Matching
+      # branch first (one shared-core change lands under one branch name in the
+      # three repos), default branch otherwise. Corollary, an ORDERING
+      # CONSTRAINT rather than a defect: a detection change is only green here
+      # once its twins are pushed to the client repos.
+      # tests/test_detection_parity.py compares detect.py against the two clients,
+      # so their sources must be here. Which REVISION is the subtle part: a shared
+      # change lands in three repos that do not have to agree on a branch name (this
+      # one is `feat/scan-cache-and-basic-auth`, the clients' is
+      # `feat/remote-sessions`). Assuming the name matched compared a new server
+      # against pre-feature clients and failed on a divergence that does not exist.
+      # Resolution, in order: same branch name, else the head of the sibling's single
+      # open PR, else its default branch. The middle rule is a heuristic and is
+      # deliberately narrow — with several PRs open we fall back rather than guess.
+      - name: Resolve the sibling revisions
+        id: siblings
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="${{ github.head_ref || github.ref_name }}"
+          for r in tui gtk; do
+            ref=""
+            if git ls-remote --exit-code --heads "https://github.com/claude-watcher/$r.git" "$branch" >/dev/null 2>&1; then
+              ref="$branch"
+            else
+              open=$(gh api "repos/claude-watcher/$r/pulls?state=open" --jq '[.[].head.ref] | join(" ")' 2>/dev/null || echo "")
+              count=$(printf '%s' "$open" | wc -w)
+              [ "$count" = "1" ] && ref="$open"
+            fi
+            echo "${r}=${ref:-<default branch>}"
+            echo "${r}_ref=${ref}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Checkout the TUI (shared detection core)
+        uses: actions/checkout@v4
+        with:
+          repository: claude-watcher/tui
+          ref: ${{ steps.siblings.outputs.tui_ref }}
+          path: _tui
+
+      - name: Checkout the GTK widget (shared detection core)
+        uses: actions/checkout@v4
+        with:
+          repository: claude-watcher/gtk
+          ref: ${{ steps.siblings.outputs.gtk_ref }}
+          path: _gtk
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:

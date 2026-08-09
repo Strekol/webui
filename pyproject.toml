@@ -23,15 +23,32 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0",
-    "mypy>=1.13.0",
-    "ruff>=0.8.0",
+    # Pinned in lockstep with the tui/gtk clients (see .pre-commit-config.yaml):
+    # detect.py is hand-aligned with their copies, so a version skew makes a
+    # back-ported change redden a PR in another repo.
+    "mypy>=2.1",
+    "ruff>=0.16",
     "pre-commit>=4.0.0",
     "detect-secrets>=1.5.0",
 ]
 
 [tool.ruff]
 line-length = 110
-target-version = "py314"
+# The CI checks the two client repos out into _tui/ and _gtk/ so
+# tests/test_detection_parity.py can compare the three implementations. They are
+# NOT this repo's code and carry their own gates — linting them here applied
+# webui's config to files that deliberately import mid-module, for 46 errors on
+# code this PR does not own.
+extend-exclude = ["_tui", "_gtk"]
+# py310, NOT py314 — deliberately BELOW `requires-python`, which stays >=3.14 (the
+# app runs on 3.14). This knob is the SYNTAX ceiling ruff may produce, and
+# `detect.py` is hand-aligned, symbol by symbol, with the copies inside
+# claude-watcher-tui.py (py311) and claude-watcher-gtk.py (py310). At py314 the
+# FORMATTER rewrites `except (A, B):` into PEP 758 `except A, B:`, which is a hard
+# SyntaxError for both clients — the shared detection core stops being copyable,
+# and `webui/tests/test_detection_parity.py` can no longer even parse them.
+# py310 = the lowest of the three. Costs nothing here: no 3.11+ syntax is in use.
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "C4", "UP"]
@@ -41,6 +58,9 @@ known-first-party = ["detect", "auth"]
 
 [tool.mypy]
 python_version = "3.14"
+# Same reason as ruff's extend-exclude: _tui/ and _gtk/ are the sibling repos the
+# CI checks out for the parity guard, not this repo's code.
+exclude = ["^_tui/", "^_gtk/"]
 check_untyped_defs = true
 disallow_untyped_defs = true
 disallow_any_generics = true
@@ -52,5 +72,5 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short --strict-markers"
 markers = ["e2e: end-to-end tests requiring external services"]

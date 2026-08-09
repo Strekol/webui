@@ -3,6 +3,12 @@ repos:
   # project's uv.lock — the SAME version CI runs (`uv run ruff format --check`) — so
   # a lint/format rule can't pass pre-commit yet fail CI on a version skew. Same
   # single-source-of-truth rationale as the mypy hook below.
+  # VERSION SKEW WARNING (the three repos move TOGETHER): detect.py is
+  # hand-aligned with the tui/gtk copies, so a change clean under one repo's
+  # ruff/mypy can redden the other two when back-ported. ruff and mypy are
+  # pinned to the same pair everywhere — ruff 0.16.x (uv.lock here,
+  # `rev: v0.16.0` in the clients' .pre-commit-config.yaml) and mypy 2.1.x
+  # (uv.lock here, `rev: v2.1.0` there). Bump all three or none.
   - repo: local
     hooks:
       - id: ruff-check
@@ -35,12 +41,6 @@ repos:
     hooks:
       - id: detect-secrets
         args: [--baseline, .secrets.baseline]
-
-  - repo: https://github.com/asottile/pyupgrade
-    rev: v3.21.2
-    hooks:
-      - id: pyupgrade
-        args: [--py314-plus]
 
   # Local hook (not mirrors-mypy): type-checking a FastAPI app needs the real
   # runtime deps (starlette/fastapi/pydantic-settings). Running mypy in the

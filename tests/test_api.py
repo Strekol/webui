@@ -1,4 +1,7 @@
 import json
+import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -40,7 +43,9 @@ async def test_meta_open(client: httpx.AsyncClient) -> None:
 
 
 async def test_sessions_open(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(detect, "scan_sessions", lambda *a, **k: [{"pid": 1, "state": "idle"}])
+    # Patch the real /proc walk, not the façade: the route goes through
+    # detect.scan_snapshot(), so a stub on scan_sessions() would never be reached.
+    monkeypatch.setattr(detect, "_scan_sessions", lambda *a, **k: [{"pid": 1, "state": "idle"}])
     r = await client.get("/api/sessions")
     assert r.status_code == 200
     body = r.json()
@@ -295,6 +300,104 @@ def test_context_window_for() -> None:
     assert detect.context_window_for("claude-haiku-4-5-20251001", 150_000) == 200_000
 
 
+def _registry_and_transcript(tmp_path: Path, status: str, last_event: dict[str, object]) -> tuple[int, str]:
+    """A config-dir instance holding one session: registry `status` + one JSONL event."""
+    pid, starttime, cwd = 4321, 7, "/tmp/bg"
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / f"{pid}.json").write_text(
+        json.dumps({"procStart": starttime, "sessionId": "sess-bg", "status": status, "cwd": cwd})
+    )
+    proj = tmp_path / "projects" / "-tmp-bg"
+    proj.mkdir(parents=True)
+    (proj / "sess-bg.jsonl").write_text(json.dumps(last_event) + "\n")
+    return pid, cwd
+
+
+# stop_reason 'end_turn' → jsonl_state 'waiting'; a system event → 'idle'; 'tool_use'
+# → 'working' (a real turn in flight).
+_TURN_OVER = {"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}}
+# ANY `type: "system"` line means "turn over" to _parse_session_lines — `subtype`
+# is never read. Named for what the parser does, not for a discrimination it makes.
+_TURN_OVER_SYSTEM = {"type": "system", "subtype": "post_turn"}
+_TURN_RUNNING = {"type": "assistant", "message": {"stop_reason": "tool_use", "content": []}}
+
+
+@pytest.mark.parametrize(
+    ("status", "event", "expected"),
+    [
+        # A stuck 'shell'/'busy' over a finished turn is background work, not a
+        # session that needs the user — the exact rule the TUI and GTK apply.
+        ("shell", _TURN_OVER, "background"),
+        ("busy", _TURN_OVER, "background"),
+        ("busy", _TURN_OVER_SYSTEM, "background"),
+        # Live turn → no reconciliation; 'compacting' is excluded on purpose.
+        ("busy", _TURN_RUNNING, "working"),
+        ("compacting", _TURN_OVER, "working"),
+    ],
+)
+def test_stuck_status_over_a_finished_turn_is_background(
+    tmp_path: Path, status: str, event: dict[str, object], expected: str
+) -> None:
+    # The server used to emit the JSONL state ('waiting'/'idle') for 'shell' only,
+    # so the same session read over the API claimed it needed the user while the
+    # local clients showed it as background.
+    pid, cwd = _registry_and_transcript(tmp_path, status, event)
+    state, *_ = detect.get_session_state(pid, cwd, starttime=7, config_dir=str(tmp_path))
+    assert state == expected
+
+
+def test_background_sorts_between_working_and_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Row order must match the clients' priority: waiting > working > background > idle.
+    states = ["idle", "background", "waiting", "working"]
+    procs = [{"pid": i, "elapsed": 1, "start_unix": 0.0, "starttime": 0} for i in range(len(states))]
+    monkeypatch.setattr(detect, "scan_proc", lambda *a, **k: (procs, {}))
+    monkeypatch.setattr(detect, "get_cwd", lambda pid: "/tmp/proj")
+    monkeypatch.setattr(detect, "get_env", lambda pid: {})
+    monkeypatch.setattr(
+        detect,
+        "get_session_state",
+        lambda pid, *a, **k: (states[pid], None, None, None, None, None),
+    )
+    assert [s["state"] for s in detect.scan_sessions()] == ["waiting", "working", "background", "idle"]
+
+
+def test_a_renamed_registry_topic_wins_over_the_ai_title(tmp_path: Path) -> None:
+    # /rename: the user's own wording is what they will recognise in the list, and
+    # both clients already prefer it. The server dropped it, so the same session
+    # showed 'my task' locally and the AI title over the API.
+    pid, starttime, cwd = 5678, 11, "/tmp/named"
+    (tmp_path / "sessions").mkdir()
+    proj = tmp_path / "projects" / "-tmp-named"
+    proj.mkdir(parents=True)
+    (proj / "sess-n.jsonl").write_text(json.dumps({"type": "ai-title", "aiTitle": "AI Title"}) + "\n")
+
+    def _state(**extra: object) -> str | None:
+        (tmp_path / "sessions" / f"{pid}.json").write_text(
+            json.dumps({"procStart": starttime, "sessionId": "sess-n", "status": "idle", "cwd": cwd, **extra})
+        )
+        return detect.get_session_state(pid, cwd, starttime, config_dir=str(tmp_path))[3]
+
+    assert _state(name="my task") == "my task"
+    # 'derived' = auto-generated from the cwd, redundant → the AI title stays.
+    assert _state(name="my task", nameSource="derived") == "AI Title"
+    assert _state() == "AI Title"
+
+
+def test_a_rootless_worktree_is_not_the_projects_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `base / ''` IS `base`: with no guard, a cwd whose project root is empty
+    # handed back the PROJECTS DIRECTORY itself — which always exists — as if it
+    # were a project. The old fallbacks ('' one side, the worktree cwd here) are
+    # both wrong: with no root there is simply no project to point at. The
+    # slugified worktree cwd is pre-created so the divergence cannot hide behind
+    # a path that happens not to exist.
+    projects = tmp_path / "projects"
+    (projects / "--claude-worktrees-wt").mkdir(parents=True)
+    monkeypatch.setattr(detect, "CLAUDE_PROJECTS_DIR", projects)
+    assert detect.cwd_to_project_dir("/.claude/worktrees/wt") is None
+
+
 def test_get_session_state_stale_registry_ignored(tmp_path: Path) -> None:
     # procStart mismatch (PID reuse) → registry ignored; no JSONL either → idle, no id.
 
@@ -313,7 +416,9 @@ def test_get_session_state_stale_registry_ignored(tmp_path: Path) -> None:
 async def test_sessions_route_forwards_show_agents(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The route must pass settings.show_agents through to scan_sessions verbatim.
+    # The route must pass settings.show_agents through to the scan verbatim. Patch
+    # the real walk: scan_snapshot() forwards the flag to it (and keys its cache on
+    # it), so this also proves the flag survives the cache layer.
     import main
 
     captured: dict[str, bool] = {}
@@ -323,7 +428,7 @@ async def test_sessions_route_forwards_show_agents(
         return []
 
     monkeypatch.setattr(main.settings, "show_agents", False)
-    monkeypatch.setattr(detect, "scan_sessions", fake)
+    monkeypatch.setattr(detect, "_scan_sessions", fake)
     r = await client.get("/api/sessions")
     assert r.status_code == 200
     assert captured["v"] is False
@@ -353,3 +458,74 @@ async def test_index_serves_filter_controls(client: httpx.AsyncClient) -> None:
         ".controls[hidden]",
     ):
         assert needle in html, needle
+
+
+def _run_page_js(snippet: str) -> str:
+    """Execute a snippet against the page's own JS, via node. Returns stdout.
+
+    The bucket/sort logic lives only in static/index.html and no Python test can
+    reach it — which is exactly how a regression shipped: `bucket()` gained the
+    `background` state (idle 2 → 3) while its consumer still tested the literal
+    `2`, so idle rows silently stopped being idle-sorted and background rows
+    started being. Extracting the two functions and running them under node is the
+    cheapest thing that turns that class of drift into a red test.
+    """
+    page = (Path(__file__).resolve().parent.parent / "static" / "index.html").read_text()
+    # Pull the two functions verbatim out of the page — no second copy to drift.
+    start = page.index("const BUCKET =")
+    end = page.index("function authHeaders", start)
+    src = page[start:end]
+    proc = subprocess.run(
+        ["node", "-e", src + "\nconst prefs={sort:'idle'};\n" + snippet],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
+def test_page_idle_sort_orders_idle_rows_and_spares_background() -> None:
+    """`sort=idle` must order IDLE rows by idle time and leave background alone.
+
+    Both halves matter: the mode exists for idle rows, and a background session is
+    running — the TUI (claude-watcher-tui.py) and the GTK widget both exclude it
+    from this ordering for that reason.
+    """
+    if not shutil.which("node"):
+        # Never a silent skip in CI: an untested layer that reports "passed" is how
+        # the regression this test exists for reached main in the first place.
+        if os.getenv("CI"):
+            pytest.fail("node is required to run the page-JS tests in CI")
+        pytest.skip("node not installed")
+
+    out = _run_page_js(
+        """
+        const rows = [
+          {state:'idle',       project:'alpha', idle_seconds:9000},
+          {state:'idle',       project:'zeta',  idle_seconds:10},
+          {state:'background', project:'alpha', idle_seconds:9000},
+          {state:'background', project:'zeta',  idle_seconds:10},
+        ];
+        const s = sortSessions(rows);
+        console.log(s.map(r => r.state + ':' + r.project).join(','));
+        """
+    )
+    order = out.split(",")
+    # Idle rows: most-recently-idle first → zeta (10s) before alpha (9000s).
+    assert order[2:] == ["idle:zeta", "idle:alpha"], out
+    # Background rows: server order kept (alphabetical), NOT idle-sorted.
+    assert order[:2] == ["background:alpha", "background:zeta"], out
+
+
+def test_page_bucket_order_matches_the_server() -> None:
+    if not shutil.which("node"):
+        if os.getenv("CI"):
+            pytest.fail("node is required to run the page-JS tests in CI")
+        pytest.skip("node not installed")
+    out = _run_page_js(
+        "console.log(['waiting','working','background','idle','daemon']"
+        ".map(st => bucket({state: st})).join(','))"
+    )
+    # Same priority as detect.scan_sessions' sort and both native clients.
+    assert out == "0,1,2,3,3", out
