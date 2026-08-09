@@ -50,7 +50,13 @@ REPO = Path(__file__).resolve().parent.parent
 
 # Constantes de détection : une valeur différente ici change silencieusement le
 # projet attribué à une session, ou son transcript.
-SHARED_CONSTANTS = ["_WORKTREE_MARKER", "_STATUS_MAP", "CLAUDE_PROJECTS_DIR", "DEFAULT_CONTEXT_WINDOW"]
+SHARED_CONSTANTS = [
+    "_WORKTREE_MARKER",
+    "_STATUS_MAP",
+    "_TURN_END_SUBTYPES",
+    "CLAUDE_PROJECTS_DIR",
+    "DEFAULT_CONTEXT_WINDOW",
+]
 
 # Fonctions PURES (aucune lecture de /proc ni de disque) appelables à l'identique
 # dans les trois modules. Les entrées couvrent le cas nominal ET les bords qui
@@ -77,8 +83,27 @@ PURE_CALLS: list[tuple[str, tuple[Any, ...]]] = [
     ("cwd_to_project_dir", (None, None)),
     # La racine vide vit dans son propre test plus bas : elle exige un chemin qui
     # EXISTE, ce qu'une liste statique ne peut pas préparer.
+    ("split_worktree", ("/home/u/proj/.claude/worktrees/wt/sub",)),
+    ("worktree_of", ("/home/u/proj/.claude/worktrees/wt", True)),
+    # Marqueur Claude non confirmé (transcript non résolu) : chemin brut, pas de
+    # worktree — la nuance qui distingue un vrai worktree d'un dossier qui en
+    # porte le nom par hasard.
+    ("worktree_of", ("/home/u/proj/.claude/worktrees/wt", False)),
+    ("worktree_of", ("/nexiste/pas/du/tout", True)),
+    # Worktree git ordinaire : prouvé par un `.git` FICHIER, donc rien à trouver
+    # sur un chemin absent — les trois doivent rendre (None, None) pareil.
+    ("git_worktree", ("/nexiste/pas/du/tout",)),
+    ("git_worktree", (None,)),
+    ("_find_transcript", ("sess-x", Path("/nexiste/pas/du/tout"))),
     ("_parse_session_lines", ([],)),
+    # `system` SANS sous-type et `system` de MILIEU de tour ne terminent pas le
+    # tour ; seuls les sous-types de fin le font. Trois formes, parce que c'est
+    # exactement là que le serveur et les clients ont divergé.
     ("_parse_session_lines", (['{"type": "system"}'],)),
+    ("_parse_session_lines", (['{"type": "system", "subtype": "informational"}'],)),
+    ("_parse_session_lines", (['{"type": "system", "subtype": "turn_duration"}'],)),
+    ("_parse_session_lines", (['{"type": "system", "subtype": "stop_hook_summary"}'],)),
+    ("_parse_session_lines", (['{"type": "system", "subtype": "away_summary"}'],)),
     ("_parse_session_lines", (['{"type": "assistant", "message": {"content": [{"type": "tool_use"}]}}'],)),
     ("_parse_session_lines", (["pas du json"],)),
 ]

@@ -35,7 +35,7 @@ the `claude daemon`, which is not a real session) among others.
 |---|---|
 | `waiting` | blocked on you — a permission prompt or the end of a turn |
 | `working` | Claude is computing (registry `busy`/`shell`/`compacting`) |
-| `background` | the registry still says `busy`/`shell` but the transcript shows the turn is over: background work (a `!cmd`, a backgrounded Bash, a Monitor, or an interrupted subagent leaving `busy` pinned). Claude is neither computing nor waiting on you |
+| `background` | the registry still says `shell` but the transcript shows the turn is over: a background shell really is running (a `!cmd`, a backgrounded Bash, a Monitor). Claude is neither computing nor waiting on you. A pinned `busy` is NOT this — nothing runs there, so the transcript state (`waiting`/`idle`) is used instead |
 | `idle` | nothing in flight |
 
 Rows are sorted **waiting → working → background → idle**, then by project.
