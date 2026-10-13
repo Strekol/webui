@@ -56,6 +56,8 @@ SHARED_CONSTANTS = [
     "_TURN_END_SUBTYPES",
     "CLAUDE_PROJECTS_DIR",
     "DEFAULT_CONTEXT_WINDOW",
+    "_AGENT_HANDBACK_TOOL",
+    "_AGENT_INTERRUPTED",
 ]
 
 # Fonctions PURES (aucune lecture de /proc ni de disque) appelables à l'identique
@@ -106,6 +108,37 @@ PURE_CALLS: list[tuple[str, tuple[Any, ...]]] = [
     ("_parse_session_lines", (['{"type": "system", "subtype": "away_summary"}'],)),
     ("_parse_session_lines", (['{"type": "assistant", "message": {"content": [{"type": "tool_use"}]}}'],)),
     ("_parse_session_lines", (["pas du json"],)),
+    # Sous-agents in-process : fin par end_turn, par handback RÉUSSI (id apparié),
+    # et les cas qui doivent rester « en cours » (outil en attente, handback refusé).
+    ("_agent_running", ([],)),
+    (
+        "_agent_running",
+        (['{"type": "user", "message": {"content": "[Request interrupted by user for tool use]"}}'],),
+    ),
+    ("_agent_running", (['{"type": "assistant", "message": {"stop_reason": "end_turn"}}'],)),
+    ("_agent_running", (['{"type": "assistant", "message": {"stop_reason": "tool_use"}}'],)),
+    (
+        "_agent_running",
+        (
+            [
+                '{"type": "assistant", "message": {"stop_reason": "tool_use", "content": '
+                '[{"type": "tool_use", "id": "t1", "name": "SubagentHandback"}]}}',
+                '{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"}]}, '
+                '"toolUseResult": {"success": true}}',
+            ],
+        ),
+    ),
+    (
+        "_agent_running",
+        (
+            [
+                '{"type": "assistant", "message": {"stop_reason": "tool_use", "content": '
+                '[{"type": "tool_use", "id": "t1", "name": "SubagentHandback"}]}}',
+                '{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"}]}, '
+                '"toolUseResult": {"success": false}}',
+            ],
+        ),
+    ),
 ]
 
 
@@ -266,3 +299,36 @@ def test_no_shared_detection_helper_was_added_on_one_side_only(clients: dict[str
     for name, mod in clients.items():
         missing = sorted(c for c in covered if not hasattr(mod, c))
         assert not missing, f"{name} ne porte pas : {missing}"
+
+
+def test_in_process_subagents_agree_in_the_three_clients(
+    clients: dict[str, ModuleType], tmp_path: Path
+) -> None:
+    """Lecture sur disque (chemin `subagents/`, filtre `since`, champs du meta) et
+    bascule d'état : rien de tout ça n'est une fonction pure, PURE_CALLS ne le
+    voit pas. Un agent en cours, un fini, un antérieur au process."""
+    proj = tmp_path / "projects" / "-tmp-proj"
+    sub = proj / "sess-1" / "subagents"
+    sub.mkdir(parents=True)
+    (proj / "sess-1.jsonl").write_text('{"type": "assistant", "message": {"stop_reason": "end_turn"}}\n')
+    for aid, sr in (("run", "tool_use"), ("done", "end_turn"), ("old", "tool_use")):
+        (sub / f"agent-{aid}.jsonl").write_text(
+            f'{{"type": "assistant", "message": {{"stop_reason": "{sr}"}}}}\n'
+        )
+        (sub / f"agent-{aid}.meta.json").write_text(
+            f'{{"description": "{aid}", "agentType": "Explore", "model": "claude-haiku-5-5"}}'
+        )
+    os.utime(sub / "agent-old.jsonl", (1000, 1000))
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / "1.json").write_text(
+        '{"procStart": 7, "sessionId": "sess-1", "cwd": "/tmp/proj", "status": "busy"}'
+    )
+    agents_args = ("sess-1", "/tmp/proj", str(tmp_path), 2000.0)
+    ours = detect.session_agents(*agents_args)
+    assert [a["name"] for a in ours] == ["run"]
+    state = detect.get_session_state(1, "/tmp/proj", 7, str(tmp_path), since=2000.0)[0]
+    assert state == "working"
+    for name, mod in clients.items():
+        assert mod.session_agents(*agents_args) == ours, f"session_agents diverge entre webui et {name}"
+        theirs = mod.get_session_state(1, "/tmp/proj", 7, str(tmp_path), since=2000.0)[0]
+        assert theirs == state, f"état avec agent en cours : webui={state} {name}={theirs}"

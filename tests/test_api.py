@@ -121,6 +121,59 @@ def test_agents_not_attached_when_session_id_mismatch(monkeypatch: pytest.Monkey
     assert rows[0]["agents"] == []
 
 
+_RUNNING = [{"pid": None, "name": "Review", "type": "Explore", "model": "haiku"}]
+
+
+def test_scan_passes_the_process_start_and_lists_running_agents(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The state counts in-process agents only when the scan hands over `since`.
+    seen: dict[str, object] = {}
+
+    def fake_state(*a: object, **k: object) -> tuple[str, int, str, None, float, str, bool]:
+        seen.update(k)
+        return ("working", 5, "Agent", None, time.time(), "sess-1", False)
+
+    _one_proc(monkeypatch, ("working", 5, "Agent", None, None, "sess-1", False))
+    monkeypatch.setattr(detect, "get_session_state", fake_state)
+    monkeypatch.setattr(detect, "session_agents", lambda *a, **k: _RUNNING)
+    rows = detect.scan_sessions()
+    assert seen["since"] == 0.0
+    assert rows[0]["agents"] == _RUNNING
+    assert detect.scan_sessions(False)[0]["agents"] == []  # list hidden, state untouched
+
+
+def _agent_on_disk(tmp_path: Path, status: str, last: str) -> None:
+    proj = tmp_path / "projects" / "-tmp-proj"
+    sub = proj / "sess-1" / "subagents"
+    sub.mkdir(parents=True)
+    end = {"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}}
+    (proj / "sess-1.jsonl").write_text(json.dumps(end) + "\n")
+    (sub / "agent-a1.jsonl").write_text(
+        json.dumps({"type": "assistant", "message": {"stop_reason": last, "content": []}}) + "\n"
+    )
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / "1.json").write_text(
+        json.dumps({"procStart": 7, "sessionId": "sess-1", "cwd": "/tmp/proj", "status": status})
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "last", "since", "expected"),
+    [
+        ("busy", "tool_use", 0.0, "working"),  # measured: registry stays busy, turn ended
+        ("busy", "tool_use", None, "waiting"),  # no `since` → agents ignored
+        ("idle", "tool_use", 0.0, "working"),
+        ("waiting", "tool_use", 0.0, "waiting"),  # a permission prompt outranks the agent
+        ("busy", "end_turn", 0.0, "waiting"),  # finished agent changes nothing
+    ],
+)
+def test_running_agent_drives_the_state(
+    tmp_path: Path, status: str, last: str, since: float | None, expected: str
+) -> None:
+    _agent_on_disk(tmp_path, status, last)
+    state, *_ = detect.get_session_state(1, "/tmp/proj", starttime=7, config_dir=str(tmp_path), since=since)
+    assert state == expected
+
+
 def test_daemon_row_is_minimal_and_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
     # A daemon proc yields a minimal row flagged `daemon` with a neutral state,
     # and the state resolver is never consulted for it.

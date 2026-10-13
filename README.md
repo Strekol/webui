@@ -26,7 +26,7 @@ the response was sent.
 `dev`/`instance` are livereload internals (`dev` true only under `APP_RELOAD`; the
 page reloads itself when `instance` changes). Each entry in `sessions[]` carries
 `project`, `state`, `bg_shell`, `context_pct`, `tool`, `topic`, `idle_seconds`, `agents[]`
-(the subagents it spawned — `{pid, name, type, model}` each) and `daemon` (true for
+(the subagents it spawned — `{pid, name, type, model}` each, `pid` null for an in-process `Agent`-tool subagent) and `daemon` (true for
 the `claude daemon`, which is not a real session) among others.
 
 `state` is one of:
@@ -112,9 +112,10 @@ APP_AUTH_TOKEN=hunter2 make run   # require a key
 Config is via `APP_*` env vars / `.env` (see `.env.example`): `APP_HOST`,
 `APP_PORT`, `APP_LOG_LEVEL`, `APP_JSON_LOGS`, `APP_AUTH_TOKEN`,
 `APP_ALLOW_INSECURE_BIND`, `APP_RELOAD`, `APP_SHOW_AGENTS`, `APP_SCAN_CACHE_TTL`. Set
-`APP_SHOW_AGENTS=false` to skip subagent detection — it spares a
+`APP_SHOW_AGENTS=false` to skip process-subagent detection — it spares a
 `/proc/<pid>/cmdline` read per non-`claude` process on each scan, worth it on a host
-with thousands of processes.
+with thousands of processes. In-process subagents are still read: a running one
+keeps its session `working`, only the `agents[]` list is emptied.
 
 `APP_SCAN_CACHE_TTL` (seconds, default `1.0`) is how long one `/proc` snapshot is
 reused **across time** — pollers arriving within the TTL of the last scan share it.
