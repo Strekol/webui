@@ -577,6 +577,7 @@ def get_session_state(
     cwd: str | None,
     starttime: int = 0,
     config_dir: str | None = None,
+    since: float | None = None,
 ) -> tuple[str, int | None, str | None, str | None, float | None, str | None, bool]:
     """Session state. Returns (state, context_pct, tool, topic, last_activity, session_id,
     bg_shell) — bg_shell says a background shell outlived the turn. The state describes
@@ -589,6 +590,9 @@ def get_session_state(
     The registry's `sessionId`, when present, gives the exact JSONL path (else we
     guess it by slugifying the cwd) and is returned so subagents can be attached to
     their parent by `--parent-session-id`.
+
+    `since` (process start) enables in-process subagents: a running one makes the
+    session `working` (see session_agents).
     """
     reg = get_session_registry(pid, starttime, config_dir)
     session_id = reg.get("sessionId") if reg else None
@@ -625,6 +629,18 @@ def get_session_state(
         if status in ("shell", "busy") and jsonl_state in ("waiting", "idle"):
             state = jsonl_state
             bg_shell = status == "shell"
+            reconciled = True
+        else:
+            reconciled = False
+        # Running in-process subagent: Claude works and resumes on its own when it
+        # ends (the registry stays 'busy'). Only a REGISTRY `waiting` (permission)
+        # wins; a `waiting` reconciled from the JSONL is just an ended turn.
+        if (
+            since is not None
+            and (state == "idle" or reconciled)
+            and session_agents(session_id, transcript_cwd, config_dir, since)
+        ):
+            state = "working"
         # Idle-since: EXACT instant of the registry's last state change (ms epoch).
         # Preferred over the JSONL mtime, which moves for background writes
         # (summaries, todos) without reflecting real inactivity. Fall back to mtime
@@ -638,6 +654,142 @@ def get_session_state(
     else:
         state = jsonl_state or "idle"
     return state, context_pct, tool, topic, last_activity, session_id, bg_shell
+
+
+# IN-PROCESS subagents (Agent tool): nothing to see in /proc, their only trace is
+# a separate transcript, <transcript without .jsonl>/subagents/agent-<id>.jsonl,
+# next to an agent-<id>.meta.json (type, description, model). The session registry
+# says nothing about them: a background agent ends the turn, so the session reads
+# `idle` while Claude is still working.
+_AGENT_HANDBACK_TOOL = "SubagentHandback"
+# What Claude writes when an agent is stopped (TaskStop) or interrupted.
+_AGENT_INTERRUPTED = "[Request interrupted by user"
+# {subagents dir: {file: (mtime, running)}} — replaced on each call by the files
+# present only: bounded by the live agents, never wiped wholesale.
+_AGENT_CACHE: dict[str, dict[str, tuple[float, bool]]] = {}
+
+
+def _agent_running(lines: list[str]) -> bool | None:
+    """Bottom-up parse of a subagent transcript: is it still running?
+
+    Finished = last assistant message with a terminal stop_reason (end_turn…), a
+    SUCCESSFUL result of its SubagentHandback (report delivered to the caller), or
+    the interruption marker (TaskStop). A refused handback (`success: false`) or a
+    message injected after it (the agent resumes on a notification from one of its
+    own background tasks) → running. None: no message in the lines read.
+    """
+    handback_id = None
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        kind = ev.get("type")
+        msg = ev.get("message") or {}
+        content = msg.get("content")
+        blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+        if kind == "assistant":
+            if handback_id is not None:
+                return not any(
+                    b.get("type") == "tool_use"
+                    and b.get("id") == handback_id
+                    and b.get("name") == _AGENT_HANDBACK_TOOL
+                    for b in blocks
+                )
+            return msg.get("stop_reason") in (None, "tool_use", "pause_turn")
+        if kind == "user" and handback_id is None:
+            text = (
+                content
+                if isinstance(content, str)
+                else next((b.get("text") for b in blocks if b.get("type") == "text"), None)
+            )
+            if isinstance(text, str) and text.startswith(_AGENT_INTERRUPTED):
+                return False
+            res = ev.get("toolUseResult")
+            if not (isinstance(res, dict) and res.get("success") is True):
+                return True
+            handback_id = next((b.get("tool_use_id") for b in blocks if b.get("type") == "tool_result"), None)
+            if handback_id is None:
+                return True
+    return None
+
+
+def session_agents(
+    session_id: str | None, cwd: str | None, config_dir: str | None, since: float
+) -> list[dict[str, Any]]:
+    """RUNNING in-process subagents of the session → [{pid, name, type, model}].
+
+    `since` = start of the claude process: an agent transcript untouched since then
+    belongs to an earlier life of the session (`claude -r`), killed with it before
+    its end was written — it would look like it runs forever. pid None: the agent
+    lives inside the session's process.
+    """
+    project_dir = cwd_to_project_dir(cwd, config_dir)
+    if not session_id or project_dir is None:
+        return []
+    transcript = _find_transcript(session_id, project_dir)
+    if transcript is None:
+        return []
+    sub = str(transcript.with_suffix("") / "subagents")
+    try:
+        entries = list(os.scandir(sub))
+    except OSError:
+        return []
+    old = _AGENT_CACHE.get(sub, {})
+    fresh: dict[str, tuple[float, bool]] = {}
+    agents: list[dict[str, Any]] = []
+    for e in entries:
+        if not (e.name.startswith("agent-") and e.name.endswith(".jsonl")):
+            continue
+        try:
+            mtime = e.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < since:
+            continue
+        cached = old.get(e.path)
+        if cached and cached[0] == mtime:
+            running = cached[1]
+        else:
+            path = Path(e.path)
+            try:
+                lines, complete = _read_tail_lines(path, _JSONL_TAIL_BYTES)
+                r = _agent_running(lines)
+                if r is None and not complete:
+                    r = _agent_running(path.read_text(errors="ignore").split("\n"))
+                # None after a full read: transcript just created, no message yet →
+                # the agent is starting.
+                running = r is not False
+            except OSError:
+                running = False
+        fresh[e.path] = (mtime, running)
+        if not running:
+            continue
+        try:
+            meta = json.loads(Path(e.path.removesuffix(".jsonl") + ".meta.json").read_text())
+        except (OSError, ValueError):
+            meta = None
+        if not isinstance(meta, dict):
+            meta = {}
+        desc, typ, model = (
+            v if isinstance(v, str) and v else None
+            for v in (meta.get("description"), meta.get("agentType"), meta.get("model"))
+        )
+        agents.append(
+            {
+                "pid": None,
+                "name": desc or e.name.removeprefix("agent-").removesuffix(".jsonl"),
+                "type": typ,
+                "model": (model or "").removeprefix("claude-") or None,
+            }
+        )
+    if len(_AGENT_CACHE) > 200:
+        _AGENT_CACHE.clear()
+    _AGENT_CACHE[sub] = fresh
+    agents.sort(key=lambda a: a["name"])
+    return agents
 
 
 def project_label(cwd: str | None) -> str:
@@ -808,7 +960,7 @@ def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
             continue
 
         state, context_pct, tool, topic, last_activity, session_id, bg_shell = get_session_state(
-            pid, cwd, p["starttime"], config_dir
+            pid, cwd, p["starttime"], config_dir, since=p["start_unix"]
         )
         # Confirmed Claude worktree (marker detected AND transcript resolved) or
         # plain git worktree (proved by its `.git` file): show the REAL project
@@ -833,9 +985,17 @@ def _scan_sessions(collect_agents: bool = True) -> list[dict[str, Any]]:
                 # yields a negative.
                 "idle_seconds": max(0, int(now - last_activity)) if last_activity is not None else None,
                 "config_dir": display_config_dir(config_dir),
-                # Subagents (Task/swarm) spawned by this session, matched on the
-                # registry sessionId == the child's --parent-session-id.
-                "agents": agents.get(session_id, []) if session_id else [],
+                # Subagents spawned by this session: process ones (swarm), matched on
+                # the registry sessionId == the child's --parent-session-id, then the
+                # running in-process ones (Agent tool).
+                # The state already counts the in-process ones, even when the list is
+                # hidden (collect_agents=False).
+                "agents": (
+                    (agents.get(session_id, []) if session_id else [])
+                    + session_agents(session_id, cwd, config_dir, p["start_unix"])
+                )
+                if collect_agents
+                else [],
                 "daemon": False,
             }
         )
