@@ -283,6 +283,123 @@ def test_scan_proc_no_proc_root() -> None:
     assert detect.scan_proc(proc_root=Path("/nonexistent-proc")) == ([], {})
 
 
+_T3_EPHEMERAL = [
+    "claude",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--input-format",
+    "stream-json",
+    "--setting-sources=user,project,local",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "default",
+    "--no-session-persistence",
+    "--settings",
+    '{"disableAllHooks":true}',
+]
+
+_EPHEMERAL_ARGVS = {
+    "t3_title_generation": _T3_EPHEMERAL,
+    "short_print": ["claude", "-p", "hi", "--no-session-persistence"],
+    "long_print": ["claude", "--print", "hi", "--no-session-persistence"],
+    "output_format_eq": ["claude", "--output-format=json", "--no-session-persistence"],
+    "input_format_eq": ["claude", "--input-format=stream-json", "--no-session-persistence"],
+    "input_format_bare": ["claude", "--input-format", "stream-json", "--no-session-persistence"],
+    "output_format_bare": ["claude", "--output-format", "json", "--no-session-persistence"],
+}
+
+_LISTED_ARGVS = {
+    "interactive": ["claude"],
+    "print_persisted": ["claude", "-p", "x"],
+    "t3_session": [
+        "claude",
+        "--session-id=0b6f4e1c-3a2d-4c1e-9f7a-1d2e3f4a5b6c",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "stream-json",
+    ],
+    "interactive_with_flag": ["claude", "--no-session-persistence"],
+    "print_only_inside_prompt": ["claude", "--no-session-persistence", "explain --print"],
+}
+
+
+def _fake_proc_root(tmp_path: Path, argvs: dict[str, list[str]]) -> dict[str, int]:
+    """Fake /proc with one comm=='claude' process per argv; returns name → pid."""
+    (tmp_path / "uptime").write_text("1000.0 500.0\n")
+    pids = {}
+    for pid, (name, argv) in enumerate(argvs.items(), start=100):
+        _write_proc(tmp_path, pid, "claude", "\x00".join(argv).encode() + b"\x00")
+        pids[name] = pid
+    return pids
+
+
+@pytest.mark.parametrize("name", sorted(_EPHEMERAL_ARGVS))
+def test_scan_proc_hides_ephemeral_headless_run(tmp_path: Path, name: str) -> None:
+    """004-AC1: --no-session-persistence + a print-mode token → no session row."""
+    _fake_proc_root(tmp_path, {name: _EPHEMERAL_ARGVS[name]})
+    assert detect.scan_proc(proc_root=tmp_path) == ([], {})
+
+
+@pytest.mark.parametrize("name", sorted(_LISTED_ARGVS))
+def test_scan_proc_keeps_non_ephemeral_claude(tmp_path: Path, name: str) -> None:
+    """004-AC2: interactive, -p, T3 session, interactive + flag, '--print' inside a prompt → listed."""
+    pids = _fake_proc_root(tmp_path, {name: _LISTED_ARGVS[name]})
+    procs, _ = detect.scan_proc(proc_root=tmp_path)
+    assert [(p["pid"], p["is_daemon"]) for p in procs] == [(pids[name], False)]
+
+
+def test_scan_proc_daemon_unaffected(tmp_path: Path) -> None:
+    """004-AC2: the daemon stays listed and flagged."""
+    _fake_proc_root(tmp_path, {"daemon": ["claude", "daemon", "run"]})
+    procs, _ = detect.scan_proc(proc_root=tmp_path)
+    assert [p["is_daemon"] for p in procs] == [True]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["claude", "-p", "x", "--settings", '{"a":"--no-session-persistence"}'],
+        ["claude", "-p", "why is --no-session-persistence ignored?"],
+    ],
+)
+def test_scan_proc_flag_inside_larger_argument_not_hidden(tmp_path: Path, argv: list[str]) -> None:
+    """004-AC3: the flag inside a --settings JSON value or a prompt does not hide the process."""
+    _fake_proc_root(tmp_path, {"p": argv})
+    procs, _ = detect.scan_proc(proc_root=tmp_path)
+    assert len(procs) == 1
+
+
+def test_scan_proc_unreadable_cmdline_still_listed(tmp_path: Path) -> None:
+    """004-AC4: an unreadable cmdline (exec/exit race) never loses the session."""
+    pids = _fake_proc_root(tmp_path, {"s": ["claude"]})
+    cmdline = tmp_path / str(pids["s"]) / "cmdline"
+    cmdline.unlink()
+    cmdline.mkdir()  # read_bytes() on a directory → OSError
+    procs, _ = detect.scan_proc(proc_root=tmp_path)
+    assert [(p["pid"], p["is_daemon"]) for p in procs] == [(pids["s"], False)]
+
+
+async def test_api_feed_never_lists_ephemeral_run(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """004-AC1: the /api/sessions feed, over a fake /proc, omits the ephemeral run."""
+    pids = _fake_proc_root(tmp_path, {"t3": _T3_EPHEMERAL, "interactive": ["claude"]})
+    real_scan_proc = detect.scan_proc
+    monkeypatch.setattr(
+        detect, "scan_proc", lambda collect_agents=True: real_scan_proc(collect_agents, proc_root=tmp_path)
+    )
+    monkeypatch.setattr(detect, "get_cwd", lambda pid: "/tmp/proj")
+    monkeypatch.setattr(detect, "get_env", lambda pid: {})
+    monkeypatch.setattr(
+        detect, "get_session_state", lambda *a, **k: ("working", 5, None, None, None, f"sess-{a[0]}", False)
+    )
+    r = await client.get("/api/sessions")
+    assert r.status_code == 200
+    assert [s["pid"] for s in r.json()["sessions"]] == [pids["interactive"]]
+
+
 def test_get_session_state_from_registry_and_jsonl(tmp_path: Path) -> None:
     # End-to-end over the real parsers: a config-dir instance routes registry and
     # transcript under tmp_path. Asserts state (from registry), context % + tool

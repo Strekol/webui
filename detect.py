@@ -59,6 +59,10 @@ def scan_proc(
     cmdline read failure never loses a claude session. `proc_root` is injectable for
     tests.
 
+    Ephemeral headless runs are skipped: exact token `--no-session-persistence` plus a
+    print-mode token (`-p`/`--print`/`--output-format[=]`/`--input-format[=]`) — the
+    flag is ignored interactively. Unreadable cmdline → still listed.
+
     Security: the agent fields (name/type/model/pid) are UNTRUSTED process argv, not
     an authenticated feed — any local process can forge --agent-id/--parent-session-id
     to appear as a subagent of another session. Display only; never used for a
@@ -90,13 +94,20 @@ def scan_proc(
                 start_unix = time.time() - elapsed
             except Exception:
                 continue
-            # cmdline is read only to tell the daemon (`claude daemon run …`) from an
-            # interactive session; unreadable (racing an exec/exit) → treated as a
-            # non-daemon, so a session is never lost over it.
+            # cmdline tells the daemon (`claude daemon run …`) and ephemeral runs apart;
+            # unreadable (racing an exec/exit) → listed as a non-daemon, so a session is
+            # never lost over it.
             try:
                 argv = (entry / "cmdline").read_bytes().decode(errors="ignore").split("\x00")
             except OSError:
                 argv = []
+            # Headless ephemeral run: no transcript to watch (see docstring).
+            if "--no-session-persistence" in argv and any(
+                a in ("-p", "--print", "--output-format", "--input-format")
+                or a.startswith(("--output-format=", "--input-format="))
+                for a in argv
+            ):
+                continue
             procs.append(
                 {
                     "pid": int(entry.name),

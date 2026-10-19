@@ -28,6 +28,8 @@ page reloads itself when `instance` changes). Each entry in `sessions[]` carries
 `project`, `state`, `bg_shell`, `context_pct`, `tool`, `topic`, `idle_seconds`, `agents[]`
 (the subagents it spawned — `{pid, name, type, model}` each, `pid` null for an in-process `Agent`-tool subagent) and `daemon` (true for
 the `claude daemon`, which is not a real session) among others.
+Ephemeral headless `claude` runs (`--no-session-persistence` in print mode, e.g. T3 Code
+title generation) have no transcript and are never listed.
 
 `state` is one of:
 
