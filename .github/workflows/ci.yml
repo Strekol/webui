@@ -36,40 +36,60 @@ jobs:
       # one is `feat/scan-cache-and-basic-auth`, the clients' is
       # `feat/remote-sessions`). Assuming the name matched compared a new server
       # against pre-feature clients and failed on a divergence that does not exist.
-      # Resolution, in order: same branch name, else the head of the sibling's single
-      # open PR, else its default branch. The middle rule is a heuristic and is
-      # deliberately narrow — with several PRs open we fall back rather than guess.
+      # Resolution, in order: same branch name in the PR author's fork, then here,
+      # else the head of the sibling's single open PR, else its default branch. The
+      # third rule is a heuristic and is deliberately narrow — with several PRs open
+      # we fall back rather than guess.
+      #
+      # Fork first because a PR from a fork pushes its twins to the same fork
+      # (assumed to keep the repo names), never here; and the open-PR rule checks
+      # out the PR's head REPO, not just its branch name, which does not exist here
+      # when the PR comes from a fork.
+      #
+      # Branch and fork owner go through env, not inline `${{ }}`: a fork PR's
+      # branch name is attacker-controlled and would be spliced into the script.
       - name: Resolve the sibling revisions
         id: siblings
         env:
           GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          FORK_OWNER: ${{ github.event.pull_request.head.repo.fork && github.event.pull_request.head.repo.owner.login || '' }}
         run: |
           set -euo pipefail
-          branch="${{ github.head_ref || github.ref_name }}"
           for r in tui gtk; do
+            repo="claude-watcher/$r"
             ref=""
-            if git ls-remote --exit-code --heads "https://github.com/claude-watcher/$r.git" "$branch" >/dev/null 2>&1; then
-              ref="$branch"
-            else
-              open=$(gh api "repos/claude-watcher/$r/pulls?state=open" --jq '[.[].head.ref] | join(" ")' 2>/dev/null || echo "")
-              count=$(printf '%s' "$open" | wc -w)
-              [ "$count" = "1" ] && ref="$open"
+            for owner in ${FORK_OWNER:+"$FORK_OWNER"} claude-watcher; do
+              if git ls-remote --exit-code --heads "https://github.com/$owner/$r.git" "$BRANCH" >/dev/null 2>&1; then
+                repo="$owner/$r"
+                ref="$BRANCH"
+                break
+              fi
+            done
+            if [ -z "$ref" ]; then
+              # `select(.head.repo)`: a PR whose fork was deleted has no head repo to check out.
+              open=$(gh api "repos/claude-watcher/$r/pulls?state=open" --jq '[.[] | select(.head.repo) | "\(.head.repo.full_name):\(.head.ref)"] | join(" ")' 2>/dev/null || echo "")
+              if [ "$(printf '%s' "$open" | wc -w)" = "1" ]; then
+                repo="${open%%:*}"
+                ref="${open#*:}"
+              fi
             fi
-            echo "${r}=${ref:-<default branch>}"
-            echo "${r}_ref=${ref}" >> "$GITHUB_OUTPUT"
+            echo "${r}=$repo@${ref:-<default branch>}"
+            echo "${r}_repo=$repo" >> "$GITHUB_OUTPUT"
+            echo "${r}_ref=$ref" >> "$GITHUB_OUTPUT"
           done
 
       - name: Checkout the TUI (shared detection core)
         uses: actions/checkout@v4
         with:
-          repository: claude-watcher/tui
+          repository: ${{ steps.siblings.outputs.tui_repo }}
           ref: ${{ steps.siblings.outputs.tui_ref }}
           path: _tui
 
       - name: Checkout the GTK widget (shared detection core)
         uses: actions/checkout@v4
         with:
-          repository: claude-watcher/gtk
+          repository: ${{ steps.siblings.outputs.gtk_repo }}
           ref: ${{ steps.siblings.outputs.gtk_ref }}
           path: _gtk
 
